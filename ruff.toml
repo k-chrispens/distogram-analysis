@@ -1,0 +1,4 @@
+exclude = [
+    ".pixi",
+    ".conda",
+]
