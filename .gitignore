@@ -35,3 +35,4 @@ share/python-wheels/
 
 # Claude files
 CLAUDE.md
+.claude/
