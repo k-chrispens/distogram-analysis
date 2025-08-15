@@ -3,6 +3,7 @@ import numpy as np
 from datetime import datetime, timezone
 from Bio import PDB
 from Bio.PDB import MMCIFParser, Superimposer
+from Bio.PDB.cealign import CEAligner
 from Bio.PDB.mmcifio import MMCIFIO
 from sklearn.decomposition import PCA
 import urllib.request
@@ -19,17 +20,23 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 class PDBClusterAnalyzer:
     def __init__(
-        self, 
-        target_pdb: str, 
-        cutoff_date: str = None, 
+        self,
+        target_pdb: str,
+        cutoff_date: str = None,
         seq_identity: float = 0.4,
         closest_n: int = 20,
-        farthest_n: int = 20
+        farthest_n: int = 20,
+        use_ce_aligner: bool = True,
+        ce_window_size: int = 8,
+        ce_max_gap: int = 30,
     ):
         self.target_pdb = target_pdb.upper()
         self.closest_n = closest_n
         self.farthest_n = farthest_n
-        
+        self.use_ce_aligner = use_ce_aligner
+        self.ce_window_size = ce_window_size
+        self.ce_max_gap = ce_max_gap
+
         if cutoff_date:
             try:
                 dt = datetime.fromisoformat(cutoff_date.replace("Z", "+00:00"))
@@ -40,11 +47,11 @@ class PDBClusterAnalyzer:
             self.cutoff_date = dt
         else:
             self.cutoff_date = None
-            
+
         self.parser = PDB.PDBParser(QUIET=True)
         self.mmcif_parser = MMCIFParser(QUIET=True)
         self.clusters_url = f"https://cdn.rcsb.org/resources/sequence/clusters/clusters-by-entity-{int(seq_identity) if seq_identity > 1 else int(seq_identity * 100)}.txt"
-        
+
         self.output_dir = f"{self.target_pdb}_ensemble_analysis"
         self._setup_directories()
 
@@ -55,10 +62,10 @@ class PDBClusterAnalyzer:
             f"{self.output_dir}/structures",
             f"{self.output_dir}/aligned_ensemble",
             f"{self.output_dir}/aligned_ensemble/closest_by_sequence",
-            f"{self.output_dir}/aligned_ensemble/farthest_by_sequence", 
+            f"{self.output_dir}/aligned_ensemble/farthest_by_sequence",
             f"{self.output_dir}/aligned_ensemble/closest_by_rmsd",
             f"{self.output_dir}/aligned_ensemble/farthest_by_rmsd",
-            f"{self.output_dir}/aligned_ensemble/reference"
+            f"{self.output_dir}/aligned_ensemble/reference",
         ]
         for directory in dirs:
             os.makedirs(directory, exist_ok=True)
@@ -175,10 +182,7 @@ class PDBClusterAnalyzer:
         raise ValueError(f"Target {self.target_pdb} not found in clusters")
 
     def get_entity_id(self, pdb_id: str) -> str:
-        url = f"https://data.rcsb.org/rest/v1/core/entry/{pdb_id}"
-        response = requests.get(url)
-        if response.status_code == 200:
-            return f"{pdb_id}_1"
+        """Convert PDB ID to entity ID format (assumes entity 1)"""
         return f"{pdb_id}_1"
 
     def filter_by_date(self, cluster: Set[str]) -> List[str]:
@@ -211,43 +215,33 @@ class PDBClusterAnalyzer:
                 continue
         return filtered
 
-    def download_structure(self, pdb_id: str, base_folder: str = None, format: str = "mmcif") -> str:
+    def download_structure(
+        self, pdb_id: str, base_folder: str = None, format: str = "mmcif"
+    ) -> str:
         """Download structure file in specified format (mmcif or pdb), checking multiple locations"""
         if base_folder is None:
             base_folder = f"{self.output_dir}/structures"
-        
-        os.makedirs(base_folder, exist_ok=True)
-        
-        # Define potential file locations to check
-        if format.lower() == "mmcif":
-            target_filename = f"{base_folder}/{pdb_id}.cif"
-            alt_locations = [
-                f"structures/{pdb_id}.cif",  # Global structures folder
-                f"{pdb_id}.cif"  # Current directory
-            ]
-            gz_filename = f"{pdb_id}.cif.gz"
-            url = f"https://files.rcsb.org/download/{pdb_id}.cif.gz"
-        else:
-            target_filename = f"{base_folder}/{pdb_id}.pdb"
-            alt_locations = [
-                f"structures/{pdb_id}.pdb",  # Global structures folder
-                f"{pdb_id}.pdb"  # Current directory
-            ]
-            gz_filename = f"{pdb_id}.pdb.gz"
-            url = f"https://files.rcsb.org/download/{pdb_id}.pdb.gz"
 
-        # Check if file already exists in target location
-        if os.path.exists(target_filename):
-            return target_filename
-        
-        # Check alternative locations and copy if found
-        for alt_path in alt_locations:
-            if os.path.exists(alt_path):
-                print(f"Found existing {pdb_id} at {alt_path}, copying to {target_filename}")
-                shutil.copy2(alt_path, target_filename)
+        os.makedirs(base_folder, exist_ok=True)
+
+        # Define file paths and URLs
+        ext = "cif" if format.lower() == "mmcif" else "pdb"
+        target_filename = f"{base_folder}/{pdb_id}.{ext}"
+
+        # Check if file already exists in target location or common locations
+        for path in [target_filename, f"structures/{pdb_id}.{ext}", f"{pdb_id}.{ext}"]:
+            if os.path.exists(path):
+                if path != target_filename:
+                    print(
+                        f"Found existing {pdb_id} at {path}, copying to {target_filename}"
+                    )
+                    shutil.copy2(path, target_filename)
                 return target_filename
 
-        # Download if not found anywhere
+        # Download if not found
+        url = f"https://files.rcsb.org/download/{pdb_id}.{ext}.gz"
+        gz_filename = f"{pdb_id}.{ext}.gz"
+
         try:
             print(f"Downloading {pdb_id}...")
             urllib.request.urlretrieve(url, gz_filename)
@@ -257,6 +251,7 @@ class PDBClusterAnalyzer:
                     f_out.write(f_in.read())
             os.remove(gz_filename)
             print(f"Downloaded and saved {pdb_id} to {target_filename}")
+
         except Exception as e:
             print(f"Error downloading {pdb_id}: {e}")
             # Try alternative format if mmcif fails
@@ -267,58 +262,102 @@ class PDBClusterAnalyzer:
 
         return target_filename
 
-    def extract_ca_coords(self, structure) -> np.ndarray:
+    def extract_ca_data(self, structure) -> Tuple[np.ndarray, List]:
+        """Extract both CA coordinates and atoms in one pass"""
         coords = []
+        atoms = []
         for model in structure:
             for chain in model:
                 for residue in chain:
                     if "CA" in residue:
-                        coords.append(residue["CA"].get_coord())
-        return np.array(coords)
-
-    def extract_ca_atoms(self, structure) -> List:
-        """Extract CA atoms (not coordinates) for Superimposer"""
-        ca_atoms = []
-        for model in structure:
-            for chain in model:
-                for residue in chain:
-                    if "CA" in residue:
-                        ca_atoms.append(residue["CA"])
-        return ca_atoms
-
-    def _validate_coords(self, ref_coords: np.ndarray, mobile_coords: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """Validate and truncate coordinates to same length"""
-        if len(ref_coords) != len(mobile_coords):
-            min_len = min(len(ref_coords), len(mobile_coords))
-            ref_coords = ref_coords[:min_len]
-            mobile_coords = mobile_coords[:min_len]
-        return ref_coords, mobile_coords
+                        ca_atom = residue["CA"]
+                        coords.append(ca_atom.get_coord())
+                        atoms.append(ca_atom)
+        return np.array(coords), atoms
 
     def _compute_rmsd(self, coords1: np.ndarray, coords2: np.ndarray) -> float:
         """Compute RMSD between two coordinate sets"""
         return np.sqrt(np.mean(np.sum((coords1 - coords2) ** 2, axis=1)))
 
-    def _align_structures_with_superimposer(self, ref_structure, mobile_structure) -> float:
+    def _align_structures_with_superimposer(
+        self, ref_structure, mobile_structure
+    ) -> float:
         """Align structures using BioPython Superimposer and return RMSD"""
-        ref_ca_atoms = self.extract_ca_atoms(ref_structure)
-        mobile_ca_atoms = self.extract_ca_atoms(mobile_structure)
-        
-        if len(ref_ca_atoms) == 0 or len(mobile_ca_atoms) == 0:
-            return float('inf')
-        
+        _, ref_atoms = self.extract_ca_data(ref_structure)
+        _, mobile_atoms = self.extract_ca_data(mobile_structure)
+
+        if not ref_atoms or not mobile_atoms:
+            return float("inf")
+
         # Use minimum length to handle different structure sizes
-        min_len = min(len(ref_ca_atoms), len(mobile_ca_atoms))
-        ref_ca_atoms = ref_ca_atoms[:min_len]
-        mobile_ca_atoms = mobile_ca_atoms[:min_len]
-        
+        min_len = min(len(ref_atoms), len(mobile_atoms))
+
         try:
             superimposer = Superimposer()
-            superimposer.set_atoms(ref_ca_atoms, mobile_ca_atoms)
-            superimposer.apply(mobile_structure.get_atoms())  # Apply to ALL atoms including altlocs
+            superimposer.set_atoms(ref_atoms[:min_len], mobile_atoms[:min_len])
+            superimposer.apply(mobile_structure.get_atoms())
             return superimposer.rms
         except Exception:
-            return float('inf')
-    
+            return float("inf")
+
+    def _align_structures_with_cealigner(
+        self, ref_structure, mobile_structure
+    ) -> Tuple[float, Dict]:
+        """Align structures using CEAligner and return RMSD with alignment info"""
+        try:
+            # Initialize CEAligner
+            aligner = CEAligner(
+                window_size=self.ce_window_size, max_gap=self.ce_max_gap
+            )
+
+            # Set reference structure
+            aligner.set_reference(ref_structure)
+
+            # Perform alignment (modifies mobile_structure in place)
+            aligner.align(mobile_structure, transform=True)
+
+            # Extract alignment information directly from aligner
+            alignment_info = {
+                "alignment_length": getattr(aligner, "alignment_length", 0),
+                "rmsd": aligner.rms,  # Use aligner.rms property directly
+                "sequence_coverage": getattr(aligner, "sequence_coverage", 0.0),
+                "method": "CEAligner",
+            }
+
+            return aligner.rms, alignment_info
+
+        except Exception as e:
+            # Fallback to Superimposer if CEAligner fails
+            rmsd = self._align_structures_with_superimposer(
+                ref_structure, mobile_structure
+            )
+            fallback_info = {
+                "alignment_length": 0,
+                "rmsd": rmsd,
+                "sequence_coverage": 0.0,
+                "method": "Superimposer_fallback",
+                "ce_error": str(e),
+            }
+            return rmsd, fallback_info
+
+    def _align_structures(self, ref_structure, mobile_structure) -> Tuple[float, Dict]:
+        """Align structures using the configured method (CEAligner or Superimposer)"""
+        if self.use_ce_aligner:
+            return self._align_structures_with_cealigner(
+                ref_structure, mobile_structure
+            )
+        else:
+            rmsd = self._align_structures_with_superimposer(
+                ref_structure, mobile_structure
+            )
+            info = {
+                "alignment_length": 0,
+                "rmsd": rmsd,
+                "sequence_coverage": 0.0,
+                "method": "Superimposer",
+            }
+            return rmsd, info
+
     def get_sequence_data(self, pdb_id: str) -> str:
         """Get sequence data for a single PDB structure"""
         try:
@@ -330,7 +369,7 @@ class PDBClusterAnalyzer:
             return ""
         except Exception:
             return ""
-    
+
     def compute_sequence_identity(self, seq1: str, seq2: str) -> float:
         """Compute sequence identity between two sequences"""
         if not seq1 or not seq2:
@@ -340,20 +379,22 @@ class PDBClusterAnalyzer:
             return 0.0
         matches = sum(1 for i in range(min_len) if seq1[i] == seq2[i])
         return matches / min_len
-    
-    def get_sequence_identities_parallel(self, target_pdb: str, pdb_ids: List[str]) -> Dict[str, float]:
+
+    def get_sequence_identities_parallel(
+        self, target_pdb: str, pdb_ids: List[str]
+    ) -> Dict[str, float]:
         """Get sequence identities to target using parallel processing"""
         seq_cache = {}
         seq_identities = {}
-        
+
         # Get all sequences in parallel
         print(f"Fetching sequences for {len(pdb_ids)} structures...")
         with ThreadPoolExecutor(max_workers=10) as executor:
             future_to_pdb = {
-                executor.submit(self.get_sequence_data, pdb_id): pdb_id 
+                executor.submit(self.get_sequence_data, pdb_id): pdb_id
                 for pdb_id in pdb_ids
             }
-            
+
             for future in as_completed(future_to_pdb):
                 pdb_id = future_to_pdb[future]
                 try:
@@ -361,7 +402,7 @@ class PDBClusterAnalyzer:
                 except Exception as e:
                     print(f"Error fetching sequence for {pdb_id}: {e}")
                     seq_cache[pdb_id] = ""
-        
+
         # Compute identities to target
         target_seq = seq_cache.get(target_pdb, "")
         for pdb_id in pdb_ids:
@@ -369,62 +410,85 @@ class PDBClusterAnalyzer:
                 seq_identities[pdb_id] = self.compute_sequence_identity(
                     target_seq, seq_cache.get(pdb_id, "")
                 )
-        
+
         return seq_identities
-    
-    def _save_aligned_structure(self, ref_structure, mobile_structure, pdb_id: str, subdirectory: str = "reference") -> float:
-        """Align and save structure using Superimposer, return RMSD"""
+
+    def _save_aligned_structure(
+        self,
+        ref_structure,
+        mobile_structure,
+        pdb_id: str,
+        subdirectory: str = "reference",
+    ) -> Tuple[float, Dict]:
+        """Align and save structure, return RMSD and alignment info"""
         output_path = f"{self.output_dir}/aligned_ensemble/{subdirectory}/{pdb_id}.cif"
-        
+
         if subdirectory == "reference":
             # Reference structure - no alignment needed
             rmsd = 0.0
+            alignment_info = {
+                "alignment_length": 0,
+                "rmsd": rmsd,
+                "sequence_coverage": 1.0,
+                "method": "reference",
+            }
         else:
             # Align mobile structure to reference (modifies mobile_structure in place)
-            rmsd = self._align_structures_with_superimposer(ref_structure, mobile_structure)
-        
+            rmsd, alignment_info = self._align_structures(
+                ref_structure, mobile_structure
+            )
+
         # Save the aligned structure
         io = MMCIFIO()
         io.set_structure(mobile_structure)
         io.save(output_path)
-        
-        return rmsd
-    
-    def select_ensemble_structures(self, pdb_ids: List[str], rmsd_matrix: np.ndarray, seq_identities: Dict[str, float]) -> Dict:
-        """Select closest and farthest structures by sequence identity and RMSD"""
-        target_idx = pdb_ids.index(self.target_pdb) if self.target_pdb in pdb_ids else 0
-        
-        # Get RMSD values to target
-        target_rmsds = rmsd_matrix[target_idx]
-        
-        # Create structure info list (excluding target)
+
+        return rmsd, alignment_info
+
+    def _save_structure_to_file(self, structure, pdb_id: str, subdirectory: str):
+        """Save an already-aligned structure to the specified subdirectory"""
+        output_path = f"{self.output_dir}/aligned_ensemble/{subdirectory}/{pdb_id}.cif"
+        io = MMCIFIO()
+        io.set_structure(structure)
+        io.save(output_path)
+
+    def _select_ensemble_by_criteria(
+        self,
+        valid_pdb_ids: List[str],
+        target_rmsds: np.ndarray,
+        seq_identities: Dict[str, float],
+        ref_idx: int,
+    ) -> Dict:
+        """Select ensemble structures by sequence identity and RMSD criteria"""
         structure_info = []
-        for i, pdb_id in enumerate(pdb_ids):
-            if i != target_idx:
+        for i, pdb_id in enumerate(valid_pdb_ids):
+            if i != ref_idx:
                 seq_id = seq_identities.get(pdb_id, 0.0)
-                structure_info.append({
-                    'pdb_id': pdb_id,
-                    'index': i,
-                    'rmsd_to_target': target_rmsds[i],
-                    'seq_identity_to_target': seq_id
-                })
-        
-        # Sort by sequence identity (descending for closest, ascending for farthest)
-        by_seq_identity = sorted(structure_info, key=lambda x: x['seq_identity_to_target'], reverse=True)
-        closest_by_seq = by_seq_identity[:self.closest_n]
-        farthest_by_seq = by_seq_identity[-self.farthest_n:]
-        
-        # Sort by RMSD (ascending for closest, descending for farthest)  
-        by_rmsd = sorted(structure_info, key=lambda x: x['rmsd_to_target'])
-        closest_by_rmsd = by_rmsd[:self.closest_n]
-        farthest_by_rmsd = by_rmsd[-self.farthest_n:]
-        
+                structure_info.append(
+                    {
+                        "pdb_id": pdb_id,
+                        "index": i,
+                        "rmsd_to_target": target_rmsds[i],
+                        "seq_identity_to_target": seq_id,
+                    }
+                )
+
+        # Sort and select by criteria
+        by_seq_identity = sorted(
+            structure_info, key=lambda x: x["seq_identity_to_target"], reverse=True
+        )
+        by_rmsd = sorted(structure_info, key=lambda x: x["rmsd_to_target"])
+
         return {
-            'target': {'pdb_id': self.target_pdb, 'index': target_idx},
-            'closest_by_sequence': closest_by_seq,
-            'farthest_by_sequence': farthest_by_seq,
-            'closest_by_rmsd': closest_by_rmsd,
-            'farthest_by_rmsd': farthest_by_rmsd
+            "target": {"pdb_id": self.target_pdb, "index": ref_idx},
+            "closest_by_sequence": by_seq_identity[: self.closest_n],
+            "farthest_by_sequence": by_seq_identity[-self.farthest_n :]
+            if len(by_seq_identity) >= self.farthest_n
+            else [],
+            "closest_by_rmsd": by_rmsd[: self.closest_n],
+            "farthest_by_rmsd": by_rmsd[-self.farthest_n :]
+            if len(by_rmsd) >= self.farthest_n
+            else [],
         }
 
     def compute_heterogeneity(self, pdb_ids: List[str]) -> Dict:
@@ -437,12 +501,12 @@ class PDBClusterAnalyzer:
         for pdb_id in pdb_ids:
             try:
                 pdb_file = self.download_structure(pdb_id, format="mmcif")
-                if pdb_file.endswith('.cif'):
+                if pdb_file.endswith(".cif"):
                     structure = self.mmcif_parser.get_structure(pdb_id, pdb_file)
                 else:
                     structure = self.parser.get_structure(pdb_id, pdb_file)
-                
-                coords = self.extract_ca_coords(structure)
+
+                coords, _ = self.extract_ca_data(structure)
                 if len(coords) > 0:
                     structures.append(structure)
                     coords_list.append(coords)
@@ -466,97 +530,104 @@ class PDBClusterAnalyzer:
 
         # Calculate sequence identities using parallel processing
         print("Computing sequence identities...")
-        seq_identities = self.get_sequence_identities_parallel(self.target_pdb, valid_pdb_ids)
+        seq_identities = self.get_sequence_identities_parallel(
+            self.target_pdb, valid_pdb_ids
+        )
 
-        # Compute target RMSDs using Superimposer (for ensemble selection only)
-        print("Computing alignment RMSDs for ensemble selection...")
+        # Compute target RMSDs and perform ensemble selection and alignment in one pass
+        print("Computing alignment RMSDs and preparing structures...")
         target_rmsds = np.zeros(len(coords_list))
         ref_structure = structures[ref_idx]
-        
+
+        # First pass: compute RMSDs for ensemble selection using temporary copies
         for i, structure in enumerate(structures):
             if i == ref_idx:
                 continue
-            # Create temporary copy for RMSD calculation only (don't save this)
+            # Create temporary copy for RMSD calculation only
             temp_structure = copy.deepcopy(structure)
-            rmsd = self._align_structures_with_superimposer(ref_structure, temp_structure)
+            rmsd, _ = self._align_structures(ref_structure, temp_structure)
             target_rmsds[i] = rmsd
 
-        # Early ensemble selection based on target distances only
+        # Select ensemble structures using helper method
         print("Selecting ensemble structures...")
-        structure_info = []
-        for i, pdb_id in enumerate(valid_pdb_ids):
-            if i != ref_idx:
-                seq_id = seq_identities.get(pdb_id, 0.0)
-                structure_info.append({
-                    'pdb_id': pdb_id,
-                    'index': i,
-                    'rmsd_to_target': target_rmsds[i],
-                    'seq_identity_to_target': seq_id
-                })
+        ensemble_selection = self._select_ensemble_by_criteria(
+            valid_pdb_ids, target_rmsds, seq_identities, ref_idx
+        )
 
-        # Select ensembles
-        by_seq_identity = sorted(structure_info, key=lambda x: x['seq_identity_to_target'], reverse=True)
-        by_rmsd = sorted(structure_info, key=lambda x: x['rmsd_to_target'])
-        
-        closest_by_seq = by_seq_identity[:self.closest_n]
-        farthest_by_seq = by_seq_identity[-self.farthest_n:] if len(by_seq_identity) >= self.farthest_n else []
-        closest_by_rmsd = by_rmsd[:self.closest_n]
-        farthest_by_rmsd = by_rmsd[-self.farthest_n:] if len(by_rmsd) >= self.farthest_n else []
+        # Get all selected PDB IDs for final alignment and saving
+        selected_pdb_ids = set()
+        for category_structures in ensemble_selection.values():
+            if isinstance(category_structures, list):  # Skip 'target' entry
+                for struct_info in category_structures:
+                    selected_pdb_ids.add(struct_info["pdb_id"])
 
-        ensemble_selection = {
-            'target': {'pdb_id': self.target_pdb, 'index': ref_idx},
-            'closest_by_sequence': closest_by_seq,
-            'farthest_by_sequence': farthest_by_seq,
-            'closest_by_rmsd': closest_by_rmsd,
-            'farthest_by_rmsd': farthest_by_rmsd
-        }
-
-        # Get selected indices
-        all_selected_indices = set()
-        for category in ['closest_by_sequence', 'farthest_by_sequence', 'closest_by_rmsd', 'farthest_by_rmsd']:
-            for struct_info in ensemble_selection[category]:
-                all_selected_indices.add(struct_info['index'])
-
-        # Save structures using fresh alignments to avoid altloc issues
-        print("Saving aligned structures...")
+        # Now align and save only the selected structures once each
+        print("Aligning and saving selected structures...")
         saved_rmsds = {}
-        
+        alignment_metadata = {}
+
         # Save reference structure (no alignment needed)
-        ref_rmsd = self._save_aligned_structure(ref_structure, ref_structure, self.target_pdb, "reference")
+        ref_rmsd, ref_info = self._save_aligned_structure(
+            ref_structure, ref_structure, self.target_pdb, "reference"
+        )
         saved_rmsds[self.target_pdb] = ref_rmsd
-        
-        # Save selected ensemble structures by reloading fresh copies for each alignment
-        for category in ['closest_by_sequence', 'farthest_by_sequence', 'closest_by_rmsd', 'farthest_by_rmsd']:
-            print(f"Saving {category} structures ({len(ensemble_selection[category])} structures)...")
+        alignment_metadata[self.target_pdb] = ref_info
+
+        # Process each selected structure only once, then copy to appropriate categories
+        fresh_structures = {}  # Cache aligned structures
+        for pdb_id in selected_pdb_ids:
+            # Load fresh structure to avoid altloc issues
+            structure_file = self.download_structure(pdb_id, format="mmcif")
+            if structure_file.endswith(".cif"):
+                fresh_structure = self.mmcif_parser.get_structure(
+                    pdb_id, structure_file
+                )
+            else:
+                fresh_structure = self.parser.get_structure(pdb_id, structure_file)
+
+            # Align once and store both RMSD and aligned structure
+            rmsd, align_info = self._align_structures(ref_structure, fresh_structure)
+            saved_rmsds[pdb_id] = rmsd
+            alignment_metadata[pdb_id] = align_info
+            fresh_structures[pdb_id] = fresh_structure
+
+        # Save aligned structures to appropriate category directories
+        for category in [
+            "closest_by_sequence",
+            "farthest_by_sequence",
+            "closest_by_rmsd",
+            "farthest_by_rmsd",
+        ]:
+            print(
+                f"Saving {category} structures ({len(ensemble_selection[category])} structures)..."
+            )
             for struct_info in ensemble_selection[category]:
-                pdb_id = struct_info['pdb_id']
-                
-                # Reload structure fresh to avoid altloc issues
-                structure_file = self.download_structure(pdb_id, format="mmcif")
-                if structure_file.endswith('.cif'):
-                    fresh_structure = self.mmcif_parser.get_structure(pdb_id, structure_file)
-                else:
-                    fresh_structure = self.parser.get_structure(pdb_id, structure_file)
-                
-                # Align and save
-                rmsd = self._save_aligned_structure(ref_structure, fresh_structure, pdb_id, category)
-                saved_rmsds[pdb_id] = rmsd
+                pdb_id = struct_info["pdb_id"]
+                if pdb_id in fresh_structures:
+                    # Save the already-aligned structure
+                    self._save_structure_to_file(
+                        fresh_structures[pdb_id], pdb_id, category
+                    )
 
         # Compute simplified analysis metrics (without full matrix calculations)
+        # Get all selected indices for metrics
         all_selected_indices = set()
-        for category in ['closest_by_sequence', 'farthest_by_sequence', 'closest_by_rmsd', 'farthest_by_rmsd']:
-            for struct_info in ensemble_selection[category]:
-                all_selected_indices.add(struct_info['index'])
-        
+        for category_structures in ensemble_selection.values():
+            if isinstance(category_structures, list):  # Skip 'target' entry
+                for struct_info in category_structures:
+                    all_selected_indices.add(struct_info["index"])
+
         selected_indices = [ref_idx] + list(all_selected_indices)
-        
+
         # Use reference structure coordinates for basic analysis
         ref_coords = coords_list[ref_idx]
         n_atoms = len(ref_coords)
-        
+
         # Simplified RMSF calculation using target RMSDs as approximation
-        rmsf = np.ones(n_atoms) * np.mean([target_rmsds[i] for i in all_selected_indices])
-        
+        rmsf = np.ones(n_atoms) * np.mean(
+            [target_rmsds[i] for i in all_selected_indices]
+        )
+
         # Simple PCA using reference coordinates (placeholder)
         pca_coords = np.tile(ref_coords.flatten(), (len(selected_indices), 1))
         pca = PCA(n_components=3)
@@ -564,7 +635,9 @@ class PDBClusterAnalyzer:
 
         # Calculate mean and max RMSD within ensemble (pairwise distances)
         ensemble_rmsds = [target_rmsds[i] for i in all_selected_indices if i != ref_idx]
-        mean_rmsd_in_ensemble = float(np.mean(ensemble_rmsds)) if ensemble_rmsds else 0.0
+        mean_rmsd_in_ensemble = (
+            float(np.mean(ensemble_rmsds)) if ensemble_rmsds else 0.0
+        )
         max_rmsd_in_ensemble = float(np.max(ensemble_rmsds)) if ensemble_rmsds else 0.0
 
         results = {
@@ -577,15 +650,33 @@ class PDBClusterAnalyzer:
             "sequence_identities": seq_identities,
             "target_rmsds": target_rmsds.tolist(),
             "saved_structure_rmsds": saved_rmsds,
-            "mean_rmsd_to_target": float(np.mean([target_rmsds[i] for i in all_selected_indices])) if all_selected_indices else 0.0,
-            "max_rmsd_to_target": float(np.max([target_rmsds[i] for i in all_selected_indices])) if all_selected_indices else 0.0,
+            "mean_rmsd_to_target": float(
+                np.mean([target_rmsds[i] for i in all_selected_indices])
+            )
+            if all_selected_indices
+            else 0.0,
+            "max_rmsd_to_target": float(
+                np.max([target_rmsds[i] for i in all_selected_indices])
+            )
+            if all_selected_indices
+            else 0.0,
             "mean_rmsd_in_ensemble": mean_rmsd_in_ensemble,
             "max_rmsd_in_ensemble": max_rmsd_in_ensemble,
-            "structural_radius": float(np.sqrt(np.mean([target_rmsds[i]**2 for i in all_selected_indices]))) if all_selected_indices else 0.0,
+            "structural_radius": float(
+                np.sqrt(np.mean([target_rmsds[i] ** 2 for i in all_selected_indices]))
+            )
+            if all_selected_indices
+            else 0.0,
             "rmsf": rmsf.tolist(),
             "mean_rmsf": float(np.mean(rmsf)),
             "pca_variance_explained": pca.explained_variance_ratio_.tolist(),
-            "ensemble_selection": ensemble_selection
+            "ensemble_selection": ensemble_selection,
+            "alignment_metadata": alignment_metadata,
+            "alignment_settings": {
+                "use_ce_aligner": self.use_ce_aligner,
+                "ce_window_size": self.ce_window_size,
+                "ce_max_gap": self.ce_max_gap,
+            },
         }
 
         return results
@@ -608,7 +699,7 @@ class PDBClusterAnalyzer:
 
         print("Computing structural heterogeneity and selecting ensemble...")
         results = self.compute_heterogeneity(filtered_pdbs)
-        
+
         # Save results to output directory
         results_file = f"{self.output_dir}/analysis_results.json"
         with open(results_file, "w") as f:
@@ -622,32 +713,46 @@ def main():
     parser = argparse.ArgumentParser(
         description="Analyze structural heterogeneity within RCSB sequence clusters and create curated ensembles"
     )
+    parser.add_argument("target", help="Target PDB ID for analysis")
     parser.add_argument(
-        "target", 
-        help="Target PDB ID for analysis"
-    )
-    parser.add_argument(
-        "--cutoff-date", 
+        "--cutoff-date",
         help="Cutoff date for structure filtering (YYYY-MM-DD)",
-        default=None
+        default=None,
     )
     parser.add_argument(
-        "--seq-identity", 
-        type=float, 
-        help="Sequence identity threshold for clustering (default: 0.4)", 
-        default=0.4
+        "--seq-identity",
+        type=float,
+        help="Sequence identity threshold for clustering (default: 0.4)",
+        default=0.4,
     )
     parser.add_argument(
-        "--closest-n", 
-        type=int, 
-        help="Number of closest structures to include in ensemble (default: 20)", 
-        default=20
+        "--closest-n",
+        type=int,
+        help="Number of closest structures to include in ensemble (default: 20)",
+        default=20,
     )
     parser.add_argument(
-        "--farthest-n", 
-        type=int, 
-        help="Number of farthest structures to include in ensemble (default: 20)", 
-        default=20
+        "--farthest-n",
+        type=int,
+        help="Number of farthest structures to include in ensemble (default: 20)",
+        default=20,
+    )
+    parser.add_argument(
+        "--no-ce-aligner",
+        action="store_true",
+        help="Disable CEAligner and use simple Superimposer for alignment",
+    )
+    parser.add_argument(
+        "--ce-window-size",
+        type=int,
+        help="CEAligner window size parameter (default: 8)",
+        default=8,
+    )
+    parser.add_argument(
+        "--ce-max-gap",
+        type=int,
+        help="CEAligner maximum gap size parameter (default: 30)",
+        default=30,
     )
 
     args = parser.parse_args()
@@ -656,6 +761,10 @@ def main():
     print(f"Sequence identity threshold: {args.seq_identity}")
     print(f"Closest structures in ensemble: {args.closest_n}")
     print(f"Farthest structures in ensemble: {args.farthest_n}")
+    print(f"Alignment method: {'Superimposer' if args.no_ce_aligner else 'CEAligner'}")
+    if not args.no_ce_aligner:
+        print(f"CEAligner window size: {args.ce_window_size}")
+        print(f"CEAligner max gap: {args.ce_max_gap}")
     if args.cutoff_date:
         print(f"Structure cutoff date: {args.cutoff_date}")
     print()
@@ -665,12 +774,15 @@ def main():
         cutoff_date=args.cutoff_date,
         seq_identity=args.seq_identity,
         closest_n=args.closest_n,
-        farthest_n=args.farthest_n
+        farthest_n=args.farthest_n,
+        use_ce_aligner=not args.no_ce_aligner,
+        ce_window_size=args.ce_window_size,
+        ce_max_gap=args.ce_max_gap,
     )
 
     try:
         results = analyzer.run_analysis()
-        
+
         if "error" in results:
             print(f"Analysis failed: {results['error']}")
             return
@@ -681,37 +793,65 @@ def main():
         print(f"Structures in curated ensemble: {results['n_structures_in_ensemble']}")
         print(f"Mean RMSD to target (ensemble): {results['mean_rmsd_to_target']:.2f} Å")
         print(f"Max RMSD to target (ensemble): {results['max_rmsd_to_target']:.2f} Å")
-        print(f"Mean pairwise RMSD (ensemble): {results['mean_rmsd_in_ensemble']:.2f} Å")
+        print(
+            f"Mean pairwise RMSD (ensemble): {results['mean_rmsd_in_ensemble']:.2f} Å"
+        )
         print(f"Max pairwise RMSD (ensemble): {results['max_rmsd_in_ensemble']:.2f} Å")
         print(f"Structural radius: {results['structural_radius']:.2f} Å")
         print(f"Mean RMSF: {results['mean_rmsf']:.2f} Å")
-        print(f"PCA variance (first 3 components): {[f'{x:.3f}' for x in results['pca_variance_explained']]}")
-        
+        print(
+            f"PCA variance (first 3 components): {[f'{x:.3f}' for x in results['pca_variance_explained']]}"
+        )
+
         print("\n=== Ensemble Selection Summary ===")
         print(f"Closest by sequence identity (top {args.closest_n}):")
-        for i, struct in enumerate(results['ensemble_selection']['closest_by_sequence'][:5]):  # Show top 5
-            print(f"  {i+1}. {struct['pdb_id']}: {struct['seq_identity_to_target']:.3f} seq ID, {struct['rmsd_to_target']:.2f} Å RMSD")
-        
+        for i, struct in enumerate(
+            results["ensemble_selection"]["closest_by_sequence"][:5]
+        ):  # Show top 5
+            print(
+                f"  {i + 1}. {struct['pdb_id']}: {struct['seq_identity_to_target']:.3f} seq ID, {struct['rmsd_to_target']:.2f} Å RMSD"
+            )
+
         print(f"\nFarthest by sequence identity (bottom {args.farthest_n}):")
-        for i, struct in enumerate(results['ensemble_selection']['farthest_by_sequence'][:5]):  # Show bottom 5
-            print(f"  {i+1}. {struct['pdb_id']}: {struct['seq_identity_to_target']:.3f} seq ID, {struct['rmsd_to_target']:.2f} Å RMSD")
-        
+        for i, struct in enumerate(
+            results["ensemble_selection"]["farthest_by_sequence"][:5]
+        ):  # Show bottom 5
+            print(
+                f"  {i + 1}. {struct['pdb_id']}: {struct['seq_identity_to_target']:.3f} seq ID, {struct['rmsd_to_target']:.2f} Å RMSD"
+            )
+
         print(f"\nClosest by RMSD (top {args.closest_n}):")
-        for i, struct in enumerate(results['ensemble_selection']['closest_by_rmsd'][:5]):  # Show top 5
-            print(f"  {i+1}. {struct['pdb_id']}: {struct['rmsd_to_target']:.2f} Å RMSD, {struct['seq_identity_to_target']:.3f} seq ID")
-        
+        for i, struct in enumerate(
+            results["ensemble_selection"]["closest_by_rmsd"][:5]
+        ):  # Show top 5
+            print(
+                f"  {i + 1}. {struct['pdb_id']}: {struct['rmsd_to_target']:.2f} Å RMSD, {struct['seq_identity_to_target']:.3f} seq ID"
+            )
+
         print(f"\nFarthest by RMSD (bottom {args.farthest_n}):")
-        for i, struct in enumerate(results['ensemble_selection']['farthest_by_rmsd'][:5]):  # Show bottom 5
-            print(f"  {i+1}. {struct['pdb_id']}: {struct['rmsd_to_target']:.2f} Å RMSD, {struct['seq_identity_to_target']:.3f} seq ID")
-        
+        for i, struct in enumerate(
+            results["ensemble_selection"]["farthest_by_rmsd"][:5]
+        ):  # Show bottom 5
+            print(
+                f"  {i + 1}. {struct['pdb_id']}: {struct['rmsd_to_target']:.2f} Å RMSD, {struct['seq_identity_to_target']:.3f} seq ID"
+            )
+
         print(f"\nOutput directory: {results['output_directory']}")
         print("- Reference structure saved in: aligned_ensemble/reference/")
-        print("- Closest by sequence structures saved in: aligned_ensemble/closest_by_sequence/")
-        print("- Farthest by sequence structures saved in: aligned_ensemble/farthest_by_sequence/")
-        print("- Closest by RMSD structures saved in: aligned_ensemble/closest_by_rmsd/")
-        print("- Farthest by RMSD structures saved in: aligned_ensemble/farthest_by_rmsd/")
+        print(
+            "- Closest by sequence structures saved in: aligned_ensemble/closest_by_sequence/"
+        )
+        print(
+            "- Farthest by sequence structures saved in: aligned_ensemble/farthest_by_sequence/"
+        )
+        print(
+            "- Closest by RMSD structures saved in: aligned_ensemble/closest_by_rmsd/"
+        )
+        print(
+            "- Farthest by RMSD structures saved in: aligned_ensemble/farthest_by_rmsd/"
+        )
         print("- Complete analysis results saved as JSON")
-        
+
     except Exception as e:
         print(f"Analysis failed with error: {e}")
         raise
