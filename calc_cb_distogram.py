@@ -577,10 +577,6 @@ def main():
             print("Proceeding with original structures...")
             alignment_info = None
 
-    # ------------------------------------------------------------------
-    # New sequence-alignment-based matrix construction with NaN padding
-    # ------------------------------------------------------------------
-
     if args.include_altlocs:
         print(
             "[WARNING] Altloc variance currently not combined with sequence alignment padding; proceeding treating only primary conformers."
@@ -768,6 +764,10 @@ def main():
     global_length = idx
     print(f"Global aligned length (with insertions): {global_length}")
 
+    # If a reference sequence or structure is provided, restrict all outputs to the window covering the reference
+    # This means: only keep columns/rows corresponding to the reference sequence (i.e., ref_global_index)
+    restrict_to_ref = ref_global_index  # indices corresponding to reference sequence positions
+
     # Second pass: build per-structure global mappings & distance matrices
     matrices = []
     names_in_order = []
@@ -818,14 +818,15 @@ def main():
                     coords[gidx] = get_cb_like_coord(
                         residues[r_idx], include_altlocs=False
                     )
+        # Restrict to reference window
+        coords_ref = coords[restrict_to_ref]
         # Distance matrix with NaN propagation
-        diff = coords[:, None, :] - coords[None, :, :]
+        diff = coords_ref[:, None, :] - coords_ref[None, :, :]
         D = np.sqrt(np.nansum(diff**2, axis=-1))
         # Where either coordinate missing -> set distance NaN explicitly
-        missing_mask = np.isnan(coords).any(axis=1)
-        # Broadcast to square
-        D[np.repeat(missing_mask[:, None], global_length, axis=1)] = np.nan
-        D[np.repeat(missing_mask[None, :], global_length, axis=0)] = np.nan
+        missing_mask = np.isnan(coords_ref).any(axis=1)
+        D[np.repeat(missing_mask[:, None], len(restrict_to_ref), axis=1)] = np.nan
+        D[np.repeat(missing_mask[None, :], len(restrict_to_ref), axis=0)] = np.nan
         matrices.append(D.astype(np.float32))
         names_in_order.append(name)
         # Save individual matrix
@@ -843,8 +844,8 @@ def main():
         plt.imshow(D, origin="lower", vmin=0.0, vmax=vmax, cmap=cmap_ind)
         plt.colorbar(label="Å")
         plt.title(f"CB–CB distances (Å) {name}")
-        plt.xlabel("Aligned index")
-        plt.ylabel("Aligned index")
+        plt.xlabel("Reference index")
+        plt.ylabel("Reference index")
         plt.tight_layout()
         plt.savefig(os.path.join(output_dirs["heatmaps"], f"{name}_cbcb_heatmap.png"))
         plt.close()
@@ -872,21 +873,20 @@ def main():
             for altloc_id, repl_map in altloc_replacements.items():
                 if not repl_map:
                     continue
+                # Only update coords in the reference window
                 D_var = D.copy()
-                # Precompute valid mask for base coords
-                base_valid = ~np.isnan(coords).any(axis=1)
-                # Create array of updated coords just at changed indices
+                base_valid = ~np.isnan(coords_ref).any(axis=1)
                 for gidx, coord in repl_map.items():
-                    # If original was missing, skip (cannot create distances)
-                    if np.isnan(coords[gidx]).any():
+                    if gidx not in restrict_to_ref:
                         continue
-                    # Compute distances to all valid residues
-                    diffs = coords[base_valid] - coord
+                    ref_idx = restrict_to_ref.index(gidx)
+                    if np.isnan(coords_ref[ref_idx]).any():
+                        continue
+                    diffs = coords_ref[base_valid] - coord
                     d_valid = np.sqrt(np.sum(diffs**2, axis=1))
-                    # Assign back
-                    D_var[gidx, base_valid] = d_valid
-                    D_var[base_valid, gidx] = d_valid
-                    D_var[gidx, gidx] = 0.0
+                    D_var[ref_idx, base_valid] = d_valid
+                    D_var[base_valid, ref_idx] = d_valid
+                    D_var[ref_idx, ref_idx] = 0.0
                 matrices.append(D_var.astype(np.float32))
                 alt_name = f"{name}_altloc{altloc_id}"
                 np.save(
@@ -906,8 +906,8 @@ def main():
                 plt.imshow(D_var, origin="lower", vmin=0.0, vmax=vmax_v, cmap=cmap_ind)
                 plt.colorbar(label="Å")
                 plt.title(f"Altloc {altloc_id} ({name})")
-                plt.xlabel("Aligned index")
-                plt.ylabel("Aligned index")
+                plt.xlabel("Reference index")
+                plt.ylabel("Reference index")
                 plt.tight_layout()
                 plt.savefig(
                     os.path.join(
@@ -918,14 +918,15 @@ def main():
 
         # Index map for this structure's aligned positions (only residues present)
         with open(os.path.join(output_dirs["indices"], f"{name}_index.tsv"), "w") as fh:
-            fh.write("global_idx\tres_idx\tresname\n")
+            fh.write("ref_idx\tres_idx\tresname\n")
             if residues:
-                for gidx, r_idx in enumerate(mapping):
+                for i, gidx in enumerate(restrict_to_ref):
+                    r_idx = mapping[gidx]
                     if r_idx != -1:
-                        fh.write(f"{gidx}\t{r_idx}\t{residues[r_idx].get_resname()}\n")
+                        fh.write(f"{i}\t{r_idx}\t{residues[r_idx].get_resname()}\n")
 
     # Stack matrices (base + altloc variants if requested)
-    stack = np.stack(matrices)  # (N, L, L)
+    stack = np.stack(matrices)  # (N, L, L) where L = len(restrict_to_ref)
     counts = np.sum(~np.isnan(stack), axis=0)
     variance_matrix = np.nanvar(stack, axis=0, ddof=1)
     variance_matrix[counts < args.min_samples] = np.nan
@@ -953,8 +954,8 @@ def main():
     fig, ax = plt.subplots(figsize=(8, 6), dpi=150)
     im = ax.imshow(variance_matrix, cmap=cmap, vmin=0, vmax=vmax)
     fig.colorbar(im, ax=ax, label="Variance (Å²)")
-    ax.set_xlabel("Aligned index")
-    ax.set_ylabel("Aligned index")
+    ax.set_xlabel("Reference index")
+    ax.set_ylabel("Reference index")
     ax.set_title(
         f"{args.plot_name} Distance Variance Decomposition (min n={args.min_samples})"
     )
@@ -962,14 +963,13 @@ def main():
     fig.savefig(f"{variance_base}_heatmap.png")
     plt.close(fig)
 
-    # Coverage matrix similar to ColabFold style
-    ref_global_chars = ["-"] * global_length
-    # Fill reference chars for reference mapping (reconstruct from alignment)
-    # Simplify: place ref sequence letters at their global indices
+    # Coverage matrix similar to ColabFold style, restricted to reference window
+    ref_global_chars = ["-"] * len(restrict_to_ref)
     for ref_pos, gidx in enumerate(ref_global_index):
-        ref_global_chars[gidx] = ref_seq[ref_pos]
+        if gidx in restrict_to_ref:
+            ref_global_chars[restrict_to_ref.index(gidx)] = ref_seq[ref_pos]
 
-    # Compute per-structure identity (global) & row matrix
+    # Compute per-structure identity (reference window) & row matrix
     coverage_rows = []
     identities = []
     for name, data in struct_data.items():
@@ -987,12 +987,12 @@ def main():
 
     for name, seq_id in identities:
         aligned_ref, aligned_seq = alignments[name]
-        # Build global mapping again to know where residues present
         mapping = build_mapping(aligned_ref, aligned_seq)
-        row = np.full(global_length, np.nan, dtype=np.float32)
-        for gidx, r_idx in enumerate(mapping):
+        row = np.full(len(restrict_to_ref), np.nan, dtype=np.float32)
+        for i, gidx in enumerate(restrict_to_ref):
+            r_idx = mapping[gidx]
             if r_idx != -1:
-                row[gidx] = seq_id
+                row[i] = seq_id
         coverage_rows.append(row)
     coverage_matrix = np.vstack(coverage_rows)
 
@@ -1009,9 +1009,9 @@ def main():
         vmax=1,
     )
     plt.colorbar(label="Sequence identity to reference")
-    plt.plot(np.arange(global_length), coverage_counts, color="black", linewidth=1)
+    plt.plot(np.arange(len(restrict_to_ref)), coverage_counts, color="black", linewidth=1)
     plt.title("Sequence coverage")
-    plt.xlabel("Positions")
+    plt.xlabel("Reference positions")
     plt.ylabel("Sequences")
     plt.tight_layout()
     plt.savefig(os.path.join(output_dirs["variance"], "sequence_coverage.png"))
