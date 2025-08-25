@@ -86,8 +86,13 @@ def compute_cbcb(residues, include_altlocs=False):
             [get_cb_like_coord(r, False) for r in residues], dtype=np.float32
         )  # Use float32 to save memory
         # Vectorized distance calculation
-        diff = coords[:, None, :] - coords[None, :, :]
-        return np.sqrt(np.sum(diff**2, axis=-1))  # (L,L)
+    diff = coords[:, None, :] - coords[None, :, :]
+    D = np.sqrt(np.sum(diff**2, axis=-1))  # (L,L)
+    # Symmetrize from upper triangle for robustness
+    U = np.triu(D, 1)
+    D = U + U.T
+    np.fill_diagonal(D, 0.0)
+    return D
 
     # Handle altlocs - create multiple matrices (optimized)
     all_coord_sets = [get_cb_like_coord(r, True) for r in residues]
@@ -110,8 +115,11 @@ def compute_cbcb(residues, include_altlocs=False):
 
         # Vectorized distance calculation
         diff = coords[:, None, :] - coords[None, :, :]
-        matrix = np.sqrt(np.sum(diff**2, axis=-1))
-        matrices.append(matrix)
+    matrix = np.sqrt(np.sum(diff**2, axis=-1))
+    U = np.triu(matrix, 1)
+    matrix = U + U.T
+    np.fill_diagonal(matrix, 0.0)
+    matrices.append(matrix)
 
     return matrices
 
@@ -229,6 +237,15 @@ def process_single_structure(
             D,
             delimiter=",",
             fmt="%.3f",
+        )
+
+        # Save compact strictly upper triangle for downstream tools
+        iu, ju = np.triu_indices(D.shape[0], k=1)
+        np.savez_compressed(
+            os.path.join(output_dirs["matrices"], f"{file_base}_cbcb_triu.npz"),
+            iu=iu,
+            ju=ju,
+            values=D[iu, ju].astype(np.float32),
         )
 
         vmax = np.percentile(D, 99) if D.size else None
@@ -766,7 +783,9 @@ def main():
 
     # If a reference sequence or structure is provided, restrict all outputs to the window covering the reference
     # This means: only keep columns/rows corresponding to the reference sequence (i.e., ref_global_index)
-    restrict_to_ref = ref_global_index  # indices corresponding to reference sequence positions
+    restrict_to_ref = (
+        ref_global_index  # indices corresponding to reference sequence positions
+    )
 
     # Second pass: build per-structure global mappings & distance matrices
     matrices = []
@@ -850,7 +869,7 @@ def main():
         plt.savefig(os.path.join(output_dirs["heatmaps"], f"{name}_cbcb_heatmap.png"))
         plt.close()
 
-        # Altloc variance expansion (optimized partial recompute)
+        # Altloc expansion (optimized partial recompute)
         if args.include_altlocs and residues:
             altloc_replacements: Dict[str, Dict[int, np.ndarray]] = {}
             for gidx, r_idx in enumerate(mapping):
@@ -915,6 +934,14 @@ def main():
                     )
                 )
                 plt.close()
+
+                iu, ju = np.triu_indices(D_var.shape[0], k=1)
+                np.savez_compressed(
+                    os.path.join(output_dirs["matrices"], f"{alt_name}_cbcb_triu.npz"),
+                    iu=iu,
+                    ju=ju,
+                    values=D_var[iu, ju].astype(np.float32),
+                )
 
         # Index map for this structure's aligned positions (only residues present)
         with open(os.path.join(output_dirs["indices"], f"{name}_index.tsv"), "w") as fh:
@@ -1009,7 +1036,9 @@ def main():
         vmax=1,
     )
     plt.colorbar(label="Sequence identity to reference")
-    plt.plot(np.arange(len(restrict_to_ref)), coverage_counts, color="black", linewidth=1)
+    plt.plot(
+        np.arange(len(restrict_to_ref)), coverage_counts, color="black", linewidth=1
+    )
     plt.title("Sequence coverage")
     plt.xlabel("Reference positions")
     plt.ylabel("Sequences")
