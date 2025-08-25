@@ -27,8 +27,12 @@ share/python-wheels/
 *.egg-info
 
 # output folders
-*distograms*/
+*distogram*/
 *analysis*/
+*wasserstein*/
+*jsd*/
+boltz*/
+density*/
 
 # Ruff cache
 .ruff_cache/
