@@ -86,13 +86,13 @@ def compute_cbcb(residues, include_altlocs=False):
             [get_cb_like_coord(r, False) for r in residues], dtype=np.float32
         )  # Use float32 to save memory
         # Vectorized distance calculation
-    diff = coords[:, None, :] - coords[None, :, :]
-    D = np.sqrt(np.sum(diff**2, axis=-1))  # (L,L)
-    # Symmetrize from upper triangle for robustness
-    U = np.triu(D, 1)
-    D = U + U.T
-    np.fill_diagonal(D, 0.0)
-    return D
+        diff = coords[:, None, :] - coords[None, :, :]
+        D = np.sqrt(np.sum(diff**2, axis=-1))  # (L,L)
+        # Symmetrize from upper triangle for robustness
+        U = np.triu(D, 1)
+        D = U + U.T
+        np.fill_diagonal(D, 0.0)
+        return D
 
     # Handle altlocs - create multiple matrices (optimized)
     all_coord_sets = [get_cb_like_coord(r, True) for r in residues]
