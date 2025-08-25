@@ -700,6 +700,7 @@ def main():
         W,
         "Wasserstein-1 (A vs B)",
         os.path.join(output_dirs["between"], "wasserstein_matrix.png"),
+        set_vmax = 2.0,
     )
     save_heatmap(
         JS_DIST,
