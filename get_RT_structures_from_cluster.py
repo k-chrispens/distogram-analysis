@@ -35,8 +35,10 @@ class PDBClusterAnalyzer:
         seq_identity: float = 0.4,
         max_workers: int | None = None,
         max_rate: float | None = None,
+        find_altlocs: bool = False,
     ):
-        self.target_cluster = target_cluster
+        # Core settings
+        self.target_cluster = int(target_cluster)
         self.seq_identity = (
             int(seq_identity) if seq_identity > 1 else int(seq_identity * 100)
         )
@@ -49,6 +51,7 @@ class PDBClusterAnalyzer:
         self.max_rate = (
             max_rate  # requests/sec across all threads; None means unlimited
         )
+        self.find_altlocs = bool(find_altlocs)
 
         if cutoff_date:
             try:
@@ -63,12 +66,242 @@ class PDBClusterAnalyzer:
 
         self.parser = PDB.PDBParser(QUIET=True)
         self.mmcif_parser = MMCIFParser(QUIET=True)
-        self.clusters_url = f"https://cdn.rcsb.org/resources/sequence/clusters/clusters-by-entity-{int(seq_identity) if seq_identity > 1 else int(seq_identity * 100)}.txt"
+        self.clusters_url = f"https://cdn.rcsb.org/resources/sequence/clusters/clusters-by-entity-{self.seq_identity}.txt"
 
+        # Output and caches
         self.output_dir = f"{self.target_cluster}_roomtemp_clusters"
-        # Local cache for entry metadata to ensure deterministic results across runs
-        self.cache_dir = os.path.join(os.path.dirname(__file__), ".cache", "rcsb_entry")
-        os.makedirs(self.cache_dir, exist_ok=True)
+        self.cache_dir = os.path.join(os.path.dirname(__file__), ".cache")
+        self.entry_cache_dir = os.path.join(self.cache_dir, "rcsb_entry")
+        self.mmcif_cache_dir = os.path.join(self.cache_dir, "mmcif")
+        os.makedirs(self.entry_cache_dir, exist_ok=True)
+        os.makedirs(self.mmcif_cache_dir, exist_ok=True)
+
+        # Altloc results
+        self._altloc_results_lock = threading.Lock()
+        self.altloc_results = {}
+
+    # -------------------- AltLoc helpers --------------------
+    def _download_mmcif_cached(self, pdb_id: str) -> str | None:
+        """Download and cache the mmCIF file for a PDB ID, returning path to .cif.
+
+        Saves to .cache/mmcif/{pdb_id}.cif. Returns None on hard failure.
+        """
+        target = os.path.join(self.mmcif_cache_dir, f"{pdb_id}.cif")
+        if os.path.exists(target) and os.path.getsize(target) > 0:
+            return target
+        # Download gz and decompress to target
+        url = f"https://files.rcsb.org/download/{pdb_id}.cif.gz"
+        tmp_gz = os.path.join(self.mmcif_cache_dir, f"{pdb_id}.cif.gz.tmp")
+        final_gz = os.path.join(self.mmcif_cache_dir, f"{pdb_id}.cif.gz")
+        try:
+            # Avoid stampede: if another thread already fetched, reuse
+            if os.path.exists(final_gz) and os.path.getsize(final_gz) > 0:
+                gz_path = final_gz
+            else:
+                urllib.request.urlretrieve(url, tmp_gz)
+                os.replace(tmp_gz, final_gz)
+                gz_path = final_gz
+            with (
+                gzip.open(gz_path, "rt") as fin,
+                open(target, "w", encoding="utf-8") as fout,
+            ):
+                shutil.copyfileobj(fin, fout)
+            return target
+        except Exception:
+            # Clean up tmp file if present
+            try:
+                if os.path.exists(tmp_gz):
+                    os.remove(tmp_gz)
+            except Exception:
+                pass
+            return None
+
+    def _analyze_altloc_segments(self, cif_path: str) -> Dict[str, Any]:
+        """Analyze altloc segments using Biotite.
+
+        Returns a dict with the following shape (JSON-serializable):
+          {
+            "present": bool,
+            "max_segment": int,
+            "segments": {
+               <chain_id>: [
+                   {
+                       "length": int,
+                       "residues": [ {"res_id": int, "res_name": str or None}, ... ]
+                   },
+                   ...
+               ],
+               ...
+            }
+          }
+
+        This records the specific residues that comprise each contiguous altloc segment
+        (instead of only the segment lengths).
+        """
+        try:
+            # Lazy imports to avoid hard dependency if flag not used
+            import numpy as np  # type: ignore
+            import biotite.structure.io.pdbx as pdbx  # type: ignore
+        except Exception as e:  # pragma: no cover
+            return {
+                "present": False,
+                "max_segment": 0,
+                "error": f"biotite import failed: {e}",
+            }
+
+        # Resolve PDBx/mmCIF file class and get_structure function dynamically
+        PDBxLike = getattr(pdbx, "PDBxFile", None)
+        if PDBxLike is None:
+            for alt_name in ("MMCIFFile", "CIFFile", "BinaryCIFFile"):
+                PDBxLike = getattr(pdbx, alt_name, None)
+                if PDBxLike is not None:
+                    break
+        get_structure = getattr(pdbx, "get_structure", None)
+        if PDBxLike is None or get_structure is None:
+            # Provide available attributes to aid debugging
+            avail = sorted([a for a in dir(pdbx) if not a.startswith("_")])
+            return {
+                "present": False,
+                "max_segment": 0,
+                "error": f"biotite pdbx reader not available (have: {', '.join(avail)})",
+            }
+
+        try:
+            with open(cif_path, "r", encoding="utf-8") as f:
+                pdbx_file = PDBxLike.read(f)  # type: ignore[call-arg]
+            # Ensure we include altloc-related fields
+            atoms = get_structure(
+                pdbx_file,
+                model=1,
+                altloc="all",
+            )  # type: ignore[arg-type]
+        except Exception as e:
+            return {"present": False, "max_segment": 0, "error": f"parse failed: {e}"}
+
+        def has_alt(aid):
+            return aid not in (None, "", ".", "?")
+
+        segments_per_chain: Dict[str, list[Dict[str, Any]]] = {}
+        max_seg = 0
+
+        # Choose altloc field name supported by this Biotite version
+        alt_field = (
+            "altloc_id"
+            if hasattr(atoms, "altloc_id")
+            else (
+                "label_alt_id"
+                if hasattr(atoms, "label_alt_id")
+                else ("alt_id" if hasattr(atoms, "alt_id") else None)
+            )
+        )
+
+        # Iterate per chain preserving order
+        for chain in np.unique(atoms.chain_id):  # type: ignore[attr-defined]
+            sel = atoms.chain_id == chain  # type: ignore[index]
+            chain_atoms = atoms[sel]
+            # Walk residues by res_id in encountered order
+            res_ids = chain_atoms.res_id  # type: ignore[attr-defined]
+            alt_ids = getattr(chain_atoms, alt_field) if alt_field else None  # type: ignore[attr-defined]
+            res_names = getattr(chain_atoms, "res_name", None)  # type: ignore[attr-defined]
+
+            # Build an ordered list of residues and a boolean per residue indicating
+            # presence of any altloc atom on that residue.
+            residues_ordered: list[tuple[int, Any]] = []  # (res_id, res_name)
+            res_flags: list[bool] = []
+            last_res = None
+            current_has_alt = False
+            current_name = None
+            n_atoms = len(res_ids)
+
+            # Helper to safely index optional arrays
+            def _get_or_none(arr, i):
+                try:
+                    return arr[i] if arr is not None else None
+                except Exception:
+                    return None
+
+            if alt_ids is None:
+                # No altloc field available in this Biotite version -> record residues but no segments
+                seen: set[int] = set()
+                for i in range(n_atoms):
+                    rid = int(res_ids[i])  # type: ignore[index]
+                    if rid not in seen:
+                        rname = _get_or_none(res_names, i)
+                        residues_ordered.append(
+                            (rid, None if rname is None else str(rname))
+                        )
+                        res_flags.append(False)
+                        seen.add(rid)
+            else:
+                for i in range(n_atoms):
+                    rid = res_ids[i]  # type: ignore[index]
+                    aid = alt_ids[i]
+                    rname = _get_or_none(res_names, i)
+                    if last_res is None:
+                        last_res = rid
+                        current_has_alt = has_alt(aid)
+                        current_name = rname
+                    elif rid != last_res:
+                        # push previous residue aggregate
+                        residues_ordered.append(
+                            (
+                                int(last_res),
+                                None if current_name is None else str(current_name),
+                            )
+                        )
+                        res_flags.append(bool(current_has_alt))
+                        # reset for new residue
+                        last_res = rid
+                        current_has_alt = has_alt(aid)
+                        current_name = rname
+                    else:
+                        # same residue, accumulate altloc presence
+                        if has_alt(aid):
+                            current_has_alt = True
+                        # keep first seen name
+                if last_res is not None:
+                    residues_ordered.append(
+                        (
+                            int(last_res),
+                            None if current_name is None else str(current_name),
+                        )
+                    )
+                    res_flags.append(bool(current_has_alt))
+
+            # Compute contiguous segments and list the specific residues for each segment
+            segs: list[Dict[str, Any]] = []
+            current_segment: list[Dict[str, Any]] = []
+            for flag, (rid, rname) in zip(res_flags, residues_ordered):
+                if flag:
+                    current_segment.append({"res_id": int(rid), "res_name": rname})
+                else:
+                    if current_segment:
+                        segs.append(
+                            {
+                                "length": len(current_segment),
+                                "residues": current_segment,
+                            }
+                        )
+                        max_seg = max(max_seg, len(current_segment))
+                        current_segment = []
+            if current_segment:
+                segs.append(
+                    {
+                        "length": len(current_segment),
+                        "residues": current_segment,
+                    }
+                )
+                max_seg = max(max_seg, len(current_segment))
+
+            if segs:
+                segments_per_chain[str(chain)] = segs
+
+        present = any(len(v) > 0 for v in segments_per_chain.values())
+        return {
+            "present": present,
+            "max_segment": int(max_seg),
+            "segments": segments_per_chain,
+        }
 
     def fetch_clusters(self) -> List[Set[str]]:
         """Fetch and validate the RCSB entity sequence clusters file.
@@ -284,7 +517,7 @@ class PDBClusterAnalyzer:
             if pdb_id == "AF":  # remove alphafold entries
                 return ("filtered", None)
             data: Dict[str, Any] | None = None
-            cache_path = os.path.join(self.cache_dir, f"{pdb_id}.json")
+            cache_path = os.path.join(self.entry_cache_dir, f"{pdb_id}.json")
             if os.path.exists(cache_path):
                 try:
                     with open(cache_path, "r", encoding="utf-8") as fh:
@@ -341,6 +574,13 @@ class PDBClusterAnalyzer:
                     return ("filtered", None)
             except Exception:
                 return ("error", entity)
+            # if not filtered yet and altloc analysis requested
+            if self.find_altlocs:
+                cif_path = self._download_mmcif_cached(pdb_id)
+                if cif_path:
+                    altres = self._analyze_altloc_segments(cif_path)
+                    with self._altloc_results_lock:
+                        self.altloc_results[pdb_id] = altres
             return ("pass", entity)
 
         # Sort to ensure deterministic iteration order
@@ -484,6 +724,21 @@ class PDBClusterAnalyzer:
         filtered_pdbs = self.filter(target_cluster)
         print(f"Filtered to {len(filtered_pdbs)} structures")
 
+        # Persist altloc results if requested
+        if self.find_altlocs and self.altloc_results:
+            out_path = os.path.join(
+                self.cache_dir,
+                f"altloc_segments_cluster{self.target_cluster}_seqid{self.seq_identity}.json",
+            )
+            try:
+                with open(out_path, "w", encoding="utf-8") as fh:
+                    json.dump(self.altloc_results, fh, indent=2, sort_keys=True)
+                print(
+                    f"Altloc analysis written to {out_path} ({len(self.altloc_results)} entries)"
+                )
+            except Exception as e:
+                print(f"Warning: failed to write altloc results: {e}")
+
         return filtered_pdbs
 
 
@@ -530,6 +785,12 @@ def main():
         help="Max request rate across all workers (requests/sec). Default unlimited.",
         default=None,
     )
+    parser.add_argument(
+        "--find-altlocs",
+        action="store_true",
+        help="For structures that pass filters, cache mmCIFs and record altloc segment presence and lengths using Biotite.",
+        default=False,
+    )
 
     args = parser.parse_args()
 
@@ -552,6 +813,7 @@ def main():
         seq_identity=args.seq_identity,
         max_workers=args.workers,
         max_rate=args.max_rate,
+        find_altlocs=args.find_altlocs,
     )
 
     try:
