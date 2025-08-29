@@ -33,6 +33,7 @@ share/python-wheels/
 *jsd*/
 boltz*/
 density*/
+.cache/
 
 # Ruff cache
 .ruff_cache/
