@@ -6,17 +6,23 @@ import urllib.request
 import gzip
 import os
 import shutil
-from typing import List, Dict, Set
+from typing import List, Dict, Set, Any
 import re
 import argparse
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from requests.adapters import HTTPAdapter
+import time
+import json
 
 try:
     from urllib3.util.retry import Retry  # type: ignore
 except Exception:  # pragma: no cover
     Retry = None  # type: ignore
+try:
+    from tqdm import tqdm  # type: ignore
+except Exception:  # pragma: no cover
+    tqdm = None  # type: ignore
 
 
 class PDBClusterAnalyzer:
@@ -25,18 +31,24 @@ class PDBClusterAnalyzer:
         target_cluster: int,
         cutoff_date: str = None,
         temperature: float = 270.0,
+        resolution: float = None,
         seq_identity: float = 0.4,
         max_workers: int | None = None,
+        max_rate: float | None = None,
     ):
         self.target_cluster = target_cluster
         self.seq_identity = (
             int(seq_identity) if seq_identity > 1 else int(seq_identity * 100)
         )
-        self.temperature = float(temperature)
+        self.temperature = temperature  # Kelvin
+        self.resolution = resolution  # Angstroms
         if max_workers is None:
             cpu = os.cpu_count() or 4
             max_workers = min(32, max(8, cpu * 4))
         self.max_workers = int(max_workers)
+        self.max_rate = (
+            max_rate  # requests/sec across all threads; None means unlimited
+        )
 
         if cutoff_date:
             try:
@@ -54,6 +66,9 @@ class PDBClusterAnalyzer:
         self.clusters_url = f"https://cdn.rcsb.org/resources/sequence/clusters/clusters-by-entity-{int(seq_identity) if seq_identity > 1 else int(seq_identity * 100)}.txt"
 
         self.output_dir = f"{self.target_cluster}_roomtemp_clusters"
+        # Local cache for entry metadata to ensure deterministic results across runs
+        self.cache_dir = os.path.join(os.path.dirname(__file__), ".cache", "rcsb_entry")
+        os.makedirs(self.cache_dir, exist_ok=True)
 
     def fetch_clusters(self) -> List[Set[str]]:
         """Fetch and validate the RCSB entity sequence clusters file.
@@ -163,7 +178,7 @@ class PDBClusterAnalyzer:
                 f"Downloaded clusters file from {url} but failed to parse: {parse_err}"
             ) from parse_err
 
-    def filter_by_temperature(self, cluster: Set[str]) -> List[str]:
+    def filter(self, cluster: Set[str]) -> List[str]:
         # Robust temperature extraction supporting dict or list under 'diffrn'
         def get_temperature(data) -> float | None:
             try:
@@ -175,7 +190,52 @@ class PDBClusterAnalyzer:
                 else:
                     temp_str = None
                 if temp_str is not None:
-                    return float(temp_str)
+                    temp = float(temp_str)
+                    return temp if 0 < temp < 1000 else None
+            except Exception:
+                return None
+            return None
+
+        def get_resolution(data) -> float | None:
+            try:
+                r = data.get("rcsb_entry_info", {}).get("resolution_combined")
+                if isinstance(r, list) and r:
+                    return float(r[0])
+                elif isinstance(r, (float, int)):
+                    return float(r)
+            except Exception:
+                return None
+            return None
+
+        def get_experimental_deposited(data) -> bool | None:
+            try:
+                has_released = data.get("rcsb_accession_info", {}).get(
+                    "has_released_experimental_data"
+                )
+                if isinstance(has_released, bool):
+                    return has_released
+                if isinstance(has_released, str):
+                    if "Y" in has_released.upper():
+                        return True
+                    elif "N" in has_released.upper():
+                        return False
+                    else:
+                        return None
+            except Exception:
+                return None
+            return None
+
+        def get_xray_experiment(data) -> bool | None:
+            try:
+                methods = data.get("exptl", [])
+                if isinstance(methods, list) and methods:
+                    method = methods[0].get("method")
+                    if isinstance(method, str):
+                        return "X-RAY" in method.upper()
+                elif isinstance(methods, dict):
+                    method = methods.get("method")
+                    if isinstance(method, str):
+                        return "X-RAY" in method.upper()
             except Exception:
                 return None
             return None
@@ -195,6 +255,7 @@ class PDBClusterAnalyzer:
                         backoff_factor=0.3,
                         status_forcelist=(429, 500, 502, 503, 504),
                         allowed_methods=("GET",),
+                        respect_retry_after_header=True,
                         raise_on_status=False,
                     )
                     adapter = HTTPAdapter(
@@ -202,6 +263,10 @@ class PDBClusterAnalyzer:
                     )
                     sess.mount("http://", adapter)
                     sess.mount("https://", adapter)
+                # Set a friendly User-Agent to avoid being treated as a bot
+                sess.headers.update(
+                    {"User-Agent": "distogram-analysis/0.1 (contact: research script)"}
+                )
                 tls.session = sess
             return sess
 
@@ -214,38 +279,146 @@ class PDBClusterAnalyzer:
                 d = d.replace(tzinfo=timezone.utc)
             return d
 
-        def worker(entity: str) -> str | None:
+        def worker(entity: str) -> tuple[str, str | None]:
             pdb_id = entity.split("_")[0]
-            url = f"https://data.rcsb.org/rest/v1/core/entry/{pdb_id}"
+            if pdb_id == "AF":  # remove alphafold entries
+                return ("filtered", None)
+            data: Dict[str, Any] | None = None
+            cache_path = os.path.join(self.cache_dir, f"{pdb_id}.json")
+            if os.path.exists(cache_path):
+                try:
+                    with open(cache_path, "r", encoding="utf-8") as fh:
+                        data = json.load(fh)
+                except Exception:
+                    data = None
+
+            if data is None:
+                url = f"https://data.rcsb.org/rest/v1/core/entry/{pdb_id}"
+                attempts = 3
+                for i in range(attempts):
+                    try:
+                        if rate_limiter is not None:
+                            rate_limiter.acquire()
+                        resp = get_session().get(url, timeout=(5, 15))
+                        if resp.status_code == 200:
+                            data = resp.json()
+                            try:
+                                with open(cache_path, "w", encoding="utf-8") as fh:
+                                    json.dump(data, fh)
+                            except Exception:
+                                pass
+                            break
+                    except Exception:
+                        pass
+                    time.sleep(0.5 * (i + 1))
+                if data is None:
+                    # Signal a fetch error for this entity
+                    return ("error", entity)
+
             try:
-                resp = get_session().get(url, timeout=15)
-                if resp.status_code != 200:
-                    return None
-                data = resp.json()
-                if not self.cutoff_date:
+                if self.cutoff_date is not None:
                     date_str = data.get("rcsb_accession_info", {}).get("deposit_date")
                     if not date_str:
-                        return None
+                        return ("filtered", None)
                     deposition_date = parse_iso_date(date_str)
                     if deposition_date > self.cutoff_date:
-                        return None
+                        return ("filtered", None)
                 temp = get_temperature(data)
-                if temp is not None and temp >= self.temperature:
-                    return entity
+                if self.temperature is not None and (
+                    temp is None or temp < self.temperature
+                ):
+                    return ("filtered", None)
+                res = get_resolution(data)
+                if self.resolution is not None and (
+                    res is None or res > self.resolution
+                ):
+                    return ("filtered", None)
+                has_released = get_experimental_deposited(data)
+                if has_released is False:
+                    return ("filtered", None)
+                is_xray = get_xray_experiment(data)
+                if is_xray is False:
+                    return ("filtered", None)
             except Exception:
-                return None
-            return None
+                return ("error", entity)
+            return ("pass", entity)
 
-        entities = list(cluster)
+        # Sort to ensure deterministic iteration order
+        entities = sorted(list(cluster))
         filtered: List[str] = []
+        errors: List[str] = []
+        # Simple token-bucket rate limiter shared across threads
+        rate_limiter = None
+        if self.max_rate and self.max_rate > 0:
+
+            class _RateLimiter:
+                def __init__(self, rate: float, capacity: float):
+                    self.rate = float(rate)
+                    self.capacity = float(capacity)
+                    self.tokens = float(capacity)
+                    self.last = time.monotonic()
+                    self.lock = threading.Lock()
+
+                def acquire(self):
+                    while True:
+                        with self.lock:
+                            now = time.monotonic()
+                            elapsed = now - self.last
+                            if elapsed > 0:
+                                self.tokens = min(
+                                    self.capacity, self.tokens + elapsed * self.rate
+                                )
+                                self.last = now
+                            if self.tokens >= 1.0:
+                                self.tokens -= 1.0
+                                return
+                            needed = 1.0 - self.tokens
+                            sleep_for = needed / self.rate if self.rate > 0 else 0.05
+                        time.sleep(min(0.5, max(0.0, sleep_for)))
+
+            rate_limiter = _RateLimiter(
+                rate=self.max_rate, capacity=max(1, self.max_workers)
+            )
+
         with ThreadPoolExecutor(max_workers=self.max_workers) as ex:
             futures = {ex.submit(worker, ent): ent for ent in entities}
+            total = len(futures)
+            pbar = (
+                tqdm(total=total, desc="Fetching entries", unit="entry")
+                if tqdm
+                else None
+            )
+            done = 0
+            step = max(1, total // 100) if total else 1
             for fut in as_completed(futures):
-                res = fut.result()
-                if res is not None:
+                status, res = fut.result()
+                if status == "pass" and res is not None:
                     filtered.append(res)
+                elif status == "error" and res is not None:
+                    errors.append(res)
+                done += 1
+                if pbar:
+                    pbar.update(1)
+                else:
+                    if done % step == 0 or done == total:
+                        print(
+                            f"\rProcessed {done}/{total} ({(done / total) * 100:.0f}%)",
+                            end="",
+                            flush=True,
+                        )
+            if pbar:
+                pbar.close()
+            else:
+                print()
 
-        return filtered
+        if errors:
+            # Deterministic failure instead of silently dropping items
+            errors_sorted = ", ".join(sorted(errors))
+            raise RuntimeError(
+                f"Failed to fetch metadata for {len(errors)} entries: {errors_sorted}. "
+                "Re-run later or set a lower --workers/--max-rate."
+            )
+        return sorted(filtered)
 
     def download_structure(
         self, pdb_id: str, base_folder: str = None, format: str = "mmcif"
@@ -308,7 +481,7 @@ class PDBClusterAnalyzer:
         print(f"Cluster size: {len(target_cluster)} entities")
 
         print("Filtering by date and temperature...")
-        filtered_pdbs = self.filter_by_temperature(target_cluster)
+        filtered_pdbs = self.filter(target_cluster)
         print(f"Filtered to {len(filtered_pdbs)} structures")
 
         return filtered_pdbs
@@ -336,13 +509,25 @@ def main():
     parser.add_argument(
         "--temperature",
         type=float,
-        help="Data collection temperature cutoff in Kelvin (default: 270K)",
-        default=270.0,
+        help="Data collection temperature cutoff in Kelvin",
+        default=None,
+    )
+    parser.add_argument(
+        "--resolution",
+        type=float,
+        help="Resolution cutoff in Angstroms (e.g., 2.5)",
+        default=None,
     )
     parser.add_argument(
         "--workers",
         type=int,
         help="Number of parallel workers for API requests (default scales with CPU)",
+        default=None,
+    )
+    parser.add_argument(
+        "--max-rate",
+        type=float,
+        help="Max request rate across all workers (requests/sec). Default unlimited.",
         default=None,
     )
 
@@ -353,7 +538,8 @@ def main():
     print(
         f"Sequence identity threshold: {args.seq_identity * 100 if args.seq_identity < 1 else args.seq_identity}%"
     )
-    print(f"Temperature cutoff: {args.temperature} K")
+    if args.temperature:
+        print(f"Temperature cutoff: {args.temperature} K")
     if args.cutoff_date:
         print(f"Structure cutoff date: {args.cutoff_date}")
     print()
@@ -362,8 +548,10 @@ def main():
         target_cluster=int(args.target),
         cutoff_date=args.cutoff_date,
         temperature=args.temperature,
+        resolution=args.resolution,
         seq_identity=args.seq_identity,
         max_workers=args.workers,
+        max_rate=args.max_rate,
     )
 
     try:
