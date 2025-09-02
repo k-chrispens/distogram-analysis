@@ -109,6 +109,8 @@ class ClusterHistogramPlotter:
         output_file: str | None = None,
         max_clusters: int | None = None,
         log_scale: bool = False,
+        show_low_overlap: bool = False,
+        low_overlap_threshold: int = 1,
     ) -> dict:
         print(f"Reading PDB IDs from {pdb_list_file}...")
         input_pdbs = self.read_pdb_list(pdb_list_file)
@@ -118,32 +120,38 @@ class ClusterHistogramPlotter:
         clusters = self.fetch_clusters()
         print(f"Loaded {len(clusters)} total clusters")
 
-        # Build (cluster_size, overlap_count) only for clusters with overlap
-        cluster_data: List[Tuple[int, int]] = []
+        # Build (cluster_size, overlap_count) for ALL clusters
+        all_cluster_records: List[Tuple[int, int]] = []
         for cluster in clusters:
             overlap = len(cluster & input_pdbs)
-            if overlap > 0:
-                cluster_data.append((len(cluster), overlap))
+            all_cluster_records.append((len(cluster), overlap))
 
-        if not cluster_data:
+        # Sort all clusters by size desc
+        clusters_by_size: List[Tuple[int, int]] = sorted(
+            all_cluster_records, key=lambda t: t[0], reverse=True
+        )
+
+        # Derive plotting data only from clusters with overlap
+        cluster_data_plot: List[Tuple[int, int]] = [
+            (size, overlap) for size, overlap in clusters_by_size if overlap > 0
+        ]
+
+        if not cluster_data_plot:
             raise RuntimeError(
                 "No clusters found that intersect with the provided PDB list."
             )
 
-        # Sort by cluster size desc
-        cluster_data.sort(key=lambda t: t[0], reverse=True)
-
         total_clusters_all = len(clusters)
-        clusters_with_overlap_all = len(cluster_data)
+        clusters_with_overlap_all = sum(1 for _, ov in clusters_by_size if ov > 0)
 
         if max_clusters:
-            cluster_data = cluster_data[:max_clusters]
+            cluster_data_plot = cluster_data_plot[:max_clusters]
             x_label_suffix = f" (showing top {max_clusters})"
         else:
             x_label_suffix = ""
 
-        cluster_sizes = [t[0] for t in cluster_data]
-        input_pdb_counts = [t[1] for t in cluster_data]
+        cluster_sizes = [t[0] for t in cluster_data_plot]
+        input_pdb_counts = [t[1] for t in cluster_data_plot]
         print(
             f"Filtered to {len(cluster_sizes)} clusters that intersect with input PDBs"
         )
@@ -230,6 +238,36 @@ class ClusterHistogramPlotter:
         else:
             plt.show()
 
+        # Optionally list clusters with no/low overlap
+        if show_low_overlap:
+            if low_overlap_threshold < 0:
+                print(
+                    f"Warning: low-overlap-threshold {low_overlap_threshold} is invalid; using 0"
+                )
+                low_overlap_threshold = 0  # type: ignore[assignment]
+
+            considered = (
+                clusters_by_size[:max_clusters] if max_clusters else clusters_by_size
+            )
+            low_overlap_list = [
+                (rank + 1, size, overlap)
+                for rank, (size, overlap) in enumerate(considered)
+                if overlap <= low_overlap_threshold
+            ]
+
+            domain_note = (
+                f"top {max_clusters} clusters by size"
+                if max_clusters
+                else "all clusters"
+            )
+            print(
+                f"\nLow-overlap clusters (overlap <= {low_overlap_threshold}) in {domain_note}: {len(low_overlap_list)}"
+            )
+            if low_overlap_list:
+                print("Rank\tClusterSize\tOverlap")
+                for r, s, o in low_overlap_list:
+                    print(f"{r}\t{s}\t{o}")
+
         return coverage_stats
 
 
@@ -261,6 +299,23 @@ def main():
         action="store_true",
         help="Use logarithmic scale for Y axis",
     )
+    parser.add_argument(
+        "--show-low-overlap",
+        action="store_true",
+        help=(
+            "Print clusters with no or low overlap (<= threshold) with the input PDB list; "
+            "respects --max-clusters domain if provided"
+        ),
+    )
+    parser.add_argument(
+        "--low-overlap-threshold",
+        type=int,
+        default=1,
+        help=(
+            "Threshold for 'very little overlap' (default: 1). "
+            "Clusters with overlap <= this value will be listed."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -283,6 +338,8 @@ def main():
             output_file=args.output,
             max_clusters=args.max_clusters,
             log_scale=args.log_scale,
+            show_low_overlap=args.show_low_overlap,
+            low_overlap_threshold=args.low_overlap_threshold,
         )
 
         print("\n=== Summary ===")
