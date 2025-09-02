@@ -2,6 +2,7 @@ import requests
 from datetime import datetime, timezone
 from Bio import PDB
 from Bio.PDB import MMCIFParser
+from Bio.PDB.MMCIF2Dict import MMCIF2Dict
 import urllib.request
 import gzip
 import os
@@ -29,13 +30,15 @@ class PDBClusterAnalyzer:
     def __init__(
         self,
         target_cluster: int,
-        cutoff_date: str = None,
-        temperature: float = 270.0,
-        resolution: float = None,
+        cutoff_date: str | None = None,
+        temperature: float | None = 270.0,
+        resolution: float | None = None,
         seq_identity: float = 0.4,
         max_workers: int | None = None,
         max_rate: float | None = None,
         find_altlocs: bool = False,
+        check_missing_residues: bool = False,
+        exclude_missing: bool = False,
     ):
         # Core settings
         self.target_cluster = int(target_cluster)
@@ -52,6 +55,8 @@ class PDBClusterAnalyzer:
             max_rate  # requests/sec across all threads; None means unlimited
         )
         self.find_altlocs = bool(find_altlocs)
+        self.check_missing_residues = bool(check_missing_residues)
+        self.exclude_missing = bool(exclude_missing)
 
         if cutoff_date:
             try:
@@ -76,16 +81,15 @@ class PDBClusterAnalyzer:
         os.makedirs(self.entry_cache_dir, exist_ok=True)
         os.makedirs(self.mmcif_cache_dir, exist_ok=True)
 
-        # Altloc results
+        # Results caches
         self._altloc_results_lock = threading.Lock()
         self.altloc_results = {}
+        self._missing_results_lock = threading.Lock()
+        self.missing_results = {}
 
     # -------------------- AltLoc helpers --------------------
     def _download_mmcif_cached(self, pdb_id: str) -> str | None:
-        """Download and cache the mmCIF file for a PDB ID, returning path to .cif.
-
-        Saves to .cache/mmcif/{pdb_id}.cif. Returns None on hard failure.
-        """
+        """Download and cache the mmCIF file for a PDB ID, returning path to .cif."""
         target = os.path.join(self.mmcif_cache_dir, f"{pdb_id}.cif")
         if os.path.exists(target) and os.path.getsize(target) > 0:
             return target
@@ -301,6 +305,55 @@ class PDBClusterAnalyzer:
             "present": present,
             "max_segment": int(max_seg),
             "segments": segments_per_chain,
+        }
+
+    # -------------------- Missing residues helpers --------------------
+    def _analyze_missing_residues(self, cif_path: str) -> Dict[str, Any]:
+        """Inspect mmCIF categories for missing or zero-occupancy residues using
+        pdbx_unobs_residues and pdbx_unobs_or_zero_occ_residues."""
+        try:
+            cif_dict = MMCIF2Dict(cif_path)
+        except Exception as e:
+            return {
+                "present": False,
+                "counts": {"unobserved": 0, "zero_occ": 0, "unobs_or_zero": 0},
+                "error": f"MMCIF2Dict parse failed: {e}",
+            }
+
+        def _category_length(prefix: str) -> int:
+            for k, v in cif_dict.items():
+                if k.startswith(prefix + "."):
+                    return len(v) if isinstance(v, list) else 1
+            return 0
+
+        unobs_count = _category_length("pdbx_unobs_residues")
+        or_zero_count = _category_length("pdbx_unobs_or_zero_occ_residues")
+
+        zero_occ_count = 0
+        occ_key_candidates = [
+            "pdbx_unobs_or_zero_occ_residues.occupancy",
+            "pdbx_unobs_or_zero_occ_residues.occupancy_flag",
+        ]
+        occ_vals: list[Any] | None = None
+        for key in occ_key_candidates:
+            if key in cif_dict:
+                vals = cif_dict[key]
+                occ_vals = vals if isinstance(vals, list) else [vals]
+                break
+        if occ_vals is not None:
+            for ov in occ_vals:
+                s = str(ov).strip().lower()
+                if s in {"0", "0.0", "zero", "0.00"}:
+                    zero_occ_count += 1
+
+        present = (unobs_count > 0) or (or_zero_count > 0)
+        return {
+            "present": bool(present),
+            "counts": {
+                "unobserved": int(unobs_count),
+                "zero_occ": int(zero_occ_count),
+                "unobs_or_zero": int(or_zero_count),
+            },
         }
 
     def fetch_clusters(self) -> List[Set[str]]:
@@ -581,6 +634,15 @@ class PDBClusterAnalyzer:
                     altres = self._analyze_altloc_segments(cif_path)
                     with self._altloc_results_lock:
                         self.altloc_results[pdb_id] = altres
+            # Missing residues analysis and optional exclusion
+            if self.check_missing_residues or self.exclude_missing:
+                cif_path = self._download_mmcif_cached(pdb_id)
+                if cif_path:
+                    miss = self._analyze_missing_residues(cif_path)
+                    with self._missing_results_lock:
+                        self.missing_results[pdb_id] = miss
+                    if self.exclude_missing and miss.get("present"):
+                        return ("filtered", None)
             return ("pass", entity)
 
         # Sort to ensure deterministic iteration order
@@ -739,6 +801,21 @@ class PDBClusterAnalyzer:
             except Exception as e:
                 print(f"Warning: failed to write altloc results: {e}")
 
+        # Persist missing-residues analysis if requested
+        if self.check_missing_residues and self.missing_results:
+            out_path = os.path.join(
+                self.cache_dir,
+                f"missing_residues_cluster{self.target_cluster}_seqid{self.seq_identity}.json",
+            )
+            try:
+                with open(out_path, "w", encoding="utf-8") as fh:
+                    json.dump(self.missing_results, fh, indent=2, sort_keys=True)
+                print(
+                    f"Missing/zero-occupancy residue analysis written to {out_path} ({len(self.missing_results)} entries)"
+                )
+            except Exception as e:
+                print(f"Warning: failed to write missing-residues results: {e}")
+
         return filtered_pdbs
 
 
@@ -791,6 +868,18 @@ def main():
         help="For structures that pass filters, cache mmCIFs and record altloc segment presence and lengths using Biotite.",
         default=False,
     )
+    parser.add_argument(
+        "--check-missing-residues",
+        action="store_true",
+        help="Inspect mmCIF for missing or zero-occupancy residues and write a JSON summary.",
+        default=False,
+    )
+    parser.add_argument(
+        "--exclude-missing",
+        action="store_true",
+        help="Exclude entries that have any missing or zero-occupancy residues (requires --check-missing-residues or will trigger mmCIF fetch).",
+        default=False,
+    )
 
     args = parser.parse_args()
 
@@ -814,6 +903,8 @@ def main():
         max_workers=args.workers,
         max_rate=args.max_rate,
         find_altlocs=args.find_altlocs,
+        check_missing_residues=(args.check_missing_residues or args.exclude_missing),
+        exclude_missing=args.exclude_missing,
     )
 
     try:
