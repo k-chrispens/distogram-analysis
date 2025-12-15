@@ -202,12 +202,6 @@ class ClusterHistogramPlotter:
             step = max(1, len(x) // 20)
             ax.set_xticks(x[::step])
 
-        ax.set_title(
-            f"RCSB Cluster Size Distribution at {self.seq_identity}% Sequence Identity\n"
-            f"with Coverage from {os.path.basename(pdb_list_file)} ({len(input_pdbs)} PDBs)",
-            fontsize=14,
-            pad=20,
-        )
         ax.legend(loc="upper right", framealpha=0.9)
 
         coverage_stats = {
