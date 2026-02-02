@@ -107,6 +107,7 @@ class ClusterHistogramPlotter:
         self,
         pdb_list_file: str,
         output_file: str | None = None,
+        data_output_file: str | None = None,  # New parameter for data output
         max_clusters: int | None = None,
         log_scale: bool = False,
         show_low_overlap: bool = False,
@@ -130,6 +131,20 @@ class ClusterHistogramPlotter:
         clusters_by_size: List[Tuple[int, int]] = sorted(
             all_cluster_records, key=lambda t: t[0], reverse=True
         )
+        
+        # --- DATA FILE OUTPUT MODIFICATION START ---
+        if data_output_file:
+            print(f"Writing cluster data to {data_output_file}...")
+            with open(data_output_file, "w") as f_out:
+                f_out.write("# Cluster data ordered by size (largest first)\n")
+                f_out.write("# Rank\tClusterSize\tInputPDBs\n")
+                for rank, (size, overlap) in enumerate(clusters_by_size):
+                    # Output all clusters or just those with overlap, depending on your preference.
+                    # This implementation outputs ALL clusters.
+                    f_out.write(f"{rank + 1}\t{size}\t{overlap}\n")
+            print(f"Cluster data saved to {data_output_file}")
+        # --- DATA FILE OUTPUT MODIFICATION END ---
+
 
         # Derive plotting data only from clusters with overlap
         cluster_data_plot: List[Tuple[int, int]] = [
@@ -153,7 +168,7 @@ class ClusterHistogramPlotter:
         cluster_sizes = [t[0] for t in cluster_data_plot]
         input_pdb_counts = [t[1] for t in cluster_data_plot]
         print(
-            f"Filtered to {len(cluster_sizes)} clusters that intersect with input PDBs"
+            f"Filtered to {len(cluster_sizes)} clusters that intersect with input PDBs for plotting"
         )
 
         # Single shared y-axis with grouped bars
@@ -187,12 +202,6 @@ class ClusterHistogramPlotter:
             step = max(1, len(x) // 20)
             ax.set_xticks(x[::step])
 
-        ax.set_title(
-            f"RCSB Cluster Size Distribution at {self.seq_identity}% Sequence Identity\n"
-            f"with Coverage from {os.path.basename(pdb_list_file)} ({len(input_pdbs)} PDBs)",
-            fontsize=14,
-            pad=20,
-        )
         ax.legend(loc="upper right", framealpha=0.9)
 
         coverage_stats = {
@@ -273,7 +282,7 @@ class ClusterHistogramPlotter:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Create histogram of RCSB cluster sizes with PDB coverage overlay",
+        description="Create histogram of RCSB cluster sizes with PDB coverage overlay and optional data output.",
     )
     parser.add_argument("pdb_list", help="Text file containing PDB IDs (one per line)")
     parser.add_argument(
@@ -285,6 +294,11 @@ def main():
     parser.add_argument(
         "--output",
         help="Output file for the plot (e.g., cluster_histogram.png)",
+        default=None,
+    )
+    parser.add_argument(
+        "--data-output", # New argument for data file
+        help="Output text file to save the cluster size and coverage data.",
         default=None,
     )
     parser.add_argument(
@@ -328,6 +342,8 @@ def main():
         print(f"Showing top {args.max_clusters} clusters")
     if args.log_scale:
         print("Using logarithmic scale")
+    if args.data_output:
+        print(f"Saving data to: {args.data_output}")
     print()
 
     plotter = ClusterHistogramPlotter(seq_identity=args.seq_identity)
@@ -336,6 +352,7 @@ def main():
         stats = plotter.create_histogram(
             args.pdb_list,
             output_file=args.output,
+            data_output_file=args.data_output, # Pass the new argument
             max_clusters=args.max_clusters,
             log_scale=args.log_scale,
             show_low_overlap=args.show_low_overlap,
@@ -352,7 +369,9 @@ def main():
 
     except Exception as e:
         print(f"Plotting failed with error: {e}")
-        raise
+        # Only re-raise the exception if not running interactively
+        if __name__ == "__main__":
+             raise
 
 
 if __name__ == "__main__":
