@@ -35,6 +35,10 @@ boltz*/
 density*/
 .cache/
 
+# output files
+*.csv
+*.log
+
 # Ruff cache
 .ruff_cache/
 

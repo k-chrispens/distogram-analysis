@@ -26,6 +26,40 @@ except Exception:  # pragma: no cover
     tqdm = None  # type: ignore
 
 
+# 4-char PDB ID, optionally followed by `_<entity>` (e.g. "1ABC" or "1ABC_1").
+# Used to drop non-PDB cluster tokens like `AF_*` (AlphaFold) or `MA_*`
+# (ModelArchive) before any RCSB metadata fetch.
+_PDB_ENTITY_RE = re.compile(r"^[0-9][A-Za-z0-9]{3}(?:_\d+)?$")
+
+
+class _RateLimiter:
+    """Thread-safe token-bucket rate limiter shared across worker threads."""
+
+    def __init__(self, rate: float, capacity: float):
+        self.rate = float(rate)
+        self.capacity = float(capacity)
+        self.tokens = float(capacity)
+        self.last = time.monotonic()
+        self.lock = threading.Lock()
+
+    def acquire(self):
+        while True:
+            with self.lock:
+                now = time.monotonic()
+                elapsed = now - self.last
+                if elapsed > 0:
+                    self.tokens = min(
+                        self.capacity, self.tokens + elapsed * self.rate
+                    )
+                    self.last = now
+                if self.tokens >= 1.0:
+                    self.tokens -= 1.0
+                    return
+                needed = 1.0 - self.tokens
+                sleep_for = needed / self.rate if self.rate > 0 else 0.05
+            time.sleep(min(0.5, max(0.0, sleep_for)))
+
+
 class PDBClusterAnalyzer:
     def __init__(
         self,
@@ -356,17 +390,30 @@ class PDBClusterAnalyzer:
             },
         }
 
-    def fetch_clusters(self) -> List[Set[str]]:
+    def fetch_clusters(
+        self,
+        keep_entity_id: bool = False,
+        cache_path: str | None = None,
+    ) -> List[Set[str]]:
         """Fetch and validate the RCSB entity sequence clusters file.
 
-        Returns a list of clusters, each cluster being a set of entity IDs like '1ABC_1'.
+        Args:
+            keep_entity_id: If True, keep the full entity token like ``"1ABC_1"``.
+                If False (default), strip the ``_<entity>`` suffix and return
+                only the 4-char PDB IDs. Note that stripping makes multi-entity
+                PDBs ambiguous (the same PDB can appear in multiple clusters).
+            cache_path: If given, read the clusters file from this path when
+                present, otherwise download and write it here atomically.
+
+        Returns:
+            List of clusters; each is a set of either entity IDs (``"1ABC_1"``)
+            or 4-char PDB IDs (``"1ABC"``) depending on ``keep_entity_id``.
 
         Raises:
             RuntimeError: If the file cannot be retrieved or is malformed/empty.
         """
         url = self.clusters_url
 
-        # Helper: parse content into clusters with basic validation
         def _parse_clusters(lines: List[str]) -> List[Set[str]]:
             lines = [ln.strip() for ln in lines if ln.strip()]
             if not lines:
@@ -389,8 +436,10 @@ class PDBClusterAnalyzer:
                         if not token_pattern.match(t):
                             bad_tokens += 1
 
-                toks = [t.split("_")[0] for t in toks if t]  # Keep only PDB IDs
-                clusters_local.append(set(toks))
+                if keep_entity_id:
+                    clusters_local.append({t for t in toks if t})
+                else:
+                    clusters_local.append({t.split("_")[0] for t in toks if t})
 
             if total_tokens > 0 and (bad_tokens / total_tokens) > 0.5:
                 raise RuntimeError(
@@ -402,7 +451,12 @@ class PDBClusterAnalyzer:
 
             return clusters_local
 
-        # Try local file first if it exists (same identity percent) next to this script
+        # Caller-supplied cache takes precedence over the script-dir lookup.
+        if cache_path and os.path.exists(cache_path) and os.path.getsize(cache_path) > 0:
+            with open(cache_path, "r", encoding="utf-8") as fh:
+                return _parse_clusters(fh.readlines())
+
+        # Try local file next to this script (same identity percent)
         identity_suffix = url.rsplit("-", 1)[-1]
         local_fname = (
             url.rsplit("/", 1)[-1]
@@ -434,28 +488,22 @@ class PDBClusterAnalyzer:
             http_error = None
 
         if response is None or response.status_code != 200:
-            # Provide an informative error and attempt a safe local fallback if present
             status_note = (
                 f"status {response.status_code}"
                 if response is not None
                 else str(http_error)
             )
-
             raise RuntimeError(
                 f"Failed to fetch clusters file from {url}: {status_note}. "
                 "If you're offline, place the file next to this script and retry."
             )
 
-        # Basic content-type sanity (don't hard-fail if missing but warn via exception on binary)
-        ctype = (response.headers or {}).get("Content-Type", "").lower()
-        if (
-            "text" not in ctype
-            and "plain" not in ctype
-            and "csv" not in ctype
-            and ctype
-        ):
-            # It's unusual to get non-text here; validate by parsing which will error if garbage
-            pass
+        if cache_path:
+            os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
+            tmp = cache_path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                fh.write(response.text)
+            os.replace(tmp, cache_path)
 
         try:
             return _parse_clusters(response.text.splitlines())
@@ -566,9 +614,11 @@ class PDBClusterAnalyzer:
             return d
 
         def worker(entity: str) -> tuple[str, str | None]:
-            pdb_id = entity.split("_")[0]
-            if pdb_id == "AF":  # remove alphafold entries
+            # Drop non-PDB tokens (e.g. AF_* AlphaFold, MA_* ModelArchive) up
+            # front so the metadata fetch only runs on real PDB entries.
+            if not _PDB_ENTITY_RE.match(entity):
                 return ("filtered", None)
+            pdb_id = entity.split("_")[0]
             data: Dict[str, Any] | None = None
             cache_path = os.path.join(self.entry_cache_dir, f"{pdb_id}.json")
             if os.path.exists(cache_path):
@@ -649,35 +699,8 @@ class PDBClusterAnalyzer:
         entities = sorted(list(cluster))
         filtered: List[str] = []
         errors: List[str] = []
-        # Simple token-bucket rate limiter shared across threads
         rate_limiter = None
         if self.max_rate and self.max_rate > 0:
-
-            class _RateLimiter:
-                def __init__(self, rate: float, capacity: float):
-                    self.rate = float(rate)
-                    self.capacity = float(capacity)
-                    self.tokens = float(capacity)
-                    self.last = time.monotonic()
-                    self.lock = threading.Lock()
-
-                def acquire(self):
-                    while True:
-                        with self.lock:
-                            now = time.monotonic()
-                            elapsed = now - self.last
-                            if elapsed > 0:
-                                self.tokens = min(
-                                    self.capacity, self.tokens + elapsed * self.rate
-                                )
-                                self.last = now
-                            if self.tokens >= 1.0:
-                                self.tokens -= 1.0
-                                return
-                            needed = 1.0 - self.tokens
-                            sleep_for = needed / self.rate if self.rate > 0 else 0.05
-                        time.sleep(min(0.5, max(0.0, sleep_for)))
-
             rate_limiter = _RateLimiter(
                 rate=self.max_rate, capacity=max(1, self.max_workers)
             )
