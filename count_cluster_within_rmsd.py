@@ -114,6 +114,19 @@ def _chain_sequence(chain_struct: "struc.AtomArray") -> Tuple[str, List[int]]:
     return "".join(seq_chars), resids
 
 
+def _altloc_letters_per_residue(
+    chain_atoms: "struc.AtomArray",
+) -> Dict[int, Set[str]]:
+    """Per-residue set of altloc IDs present (including shared markers)."""
+    out: Dict[int, Set[str]] = {}
+    starts = struc.get_residue_starts(chain_atoms, add_exclusive_stop=True)
+    altlocs = chain_atoms.altloc_id
+    res_ids = chain_atoms.res_id
+    for s, e in zip(starts[:-1], starts[1:]):
+        out[int(res_ids[s])] = {str(x) for x in altlocs[s:e]}
+    return out
+
+
 def load_reference(
     cif_path: str, chain_id: str
 ) -> Tuple[
@@ -122,11 +135,16 @@ def load_reference(
     str,
     str,
     List[int],
+    Dict[int, Set[str]],
 ]:
-    """Returns (struct_altloc_A, struct_altloc_B, entity_id, sequence, resids).
+    """Returns (struct_altloc_A, struct_altloc_B, entity_id, sequence, resids,
+    altloc_letters_per_resid).
 
-    Both altloc structures contain shared atoms (altloc '.') plus their respective
-    altloc atoms. Hydrogens and HETATM ligands are dropped.
+    Both altloc structures contain shared atoms (altloc '.' or ' ') plus their
+    respective altloc atoms. Hydrogens and HETATM ligands are dropped. The
+    altloc_letters map gives the set of altloc IDs present per residue (used
+    by the caller to decide whether the residue carries both A and B
+    alternatives).
     """
     cif = pdbx.CIFFile.read(cif_path)
     full = pdbx.get_structure(
@@ -144,15 +162,18 @@ def load_reference(
     else:
         entity_id = entity_ids[0]
 
-    mask_a = (chain_atoms.altloc_id == ".") | (chain_atoms.altloc_id == "A")
-    mask_b = (chain_atoms.altloc_id == ".") | (chain_atoms.altloc_id == "B")
+    # Shared atoms use '.' in RCSB mmCIF; ' ' (space) in some non-RCSB writers.
+    shared = (chain_atoms.altloc_id == ".") | (chain_atoms.altloc_id == " ")
+    mask_a = shared | (chain_atoms.altloc_id == "A")
+    mask_b = shared | (chain_atoms.altloc_id == "B")
     struct_a = chain_atoms[mask_a]
     struct_b = chain_atoms[mask_b]
 
     # Sequence comes from the full chain (altloc='all'); get_residue_starts collapses
     # duplicate altloc atoms into one start per residue.
     seq, resids = _chain_sequence(chain_atoms)
-    return struct_a, struct_b, entity_id, seq, resids
+    altloc_letters = _altloc_letters_per_residue(chain_atoms)
+    return struct_a, struct_b, entity_id, seq, resids, altloc_letters
 
 
 def load_member(
@@ -343,16 +364,20 @@ def evaluate_protein(
 ) -> Tuple[
     List[Tuple[str, Tuple[int, ...]]],
     Dict[str, Dict[str, int]],
+    Set[str],
 ]:
-    """Returns ``(parts, part_stats)``.
+    """Returns ``(parts, part_stats, skipped_parts)``.
 
     ``parts`` is the parsed selection in input order: list of
     ``(canonical_text, resids)``. ``part_stats`` maps each part_text to
     ``{n_within_A, n_within_B, n_evaluated, n_missing}``.
+    ``skipped_parts`` is the set of part_text values whose residues lack
+    altloc A or B coverage in the reference (so a strict A-vs-B comparison
+    isn't meaningful); these are dropped from the output entirely.
 
-    Failures (download / parse / no cluster) return ``(parts, zeros)`` so the
-    caller can still emit one row per part. Diagnostic detail goes to stdout
-    under ``--verbose``.
+    Failures (download / parse / no cluster) return zeros for every part so
+    the caller can still emit one row per part. Diagnostic detail goes to
+    stdout under ``--verbose``.
     """
     chain_id, parts = parse_selection(selection_str)
 
@@ -370,20 +395,21 @@ def evaluate_protein(
     ref_path = analyzer._download_mmcif_cached(protein_id)
     if ref_path is None:
         print(f"  [{protein_id}] reference mmCIF download failed", file=sys.stderr)
-        return (parts, _zero_stats({pt: 0 for pt, _ in parts}))
+        return (parts, _zero_stats({pt: 0 for pt, _ in parts}), set())
 
     try:
-        ref_a, ref_b, entity_id, ref_seq, ref_resids = load_reference(
-            ref_path, chain_id
+        ref_a, ref_b, entity_id, ref_seq, ref_resids, altloc_letters = (
+            load_reference(ref_path, chain_id)
         )
     except Exception as e:
         print(f"  [{protein_id}] reference parse failed: {e}", file=sys.stderr)
-        return (parts, _zero_stats({pt: 0 for pt, _ in parts}))
+        return (parts, _zero_stats({pt: 0 for pt, _ in parts}), set())
 
     # Per-part missing-residue counts and present-residue subsets for compute.
     ref_resid_set = set(ref_resids)
     part_missing_count: Dict[str, int] = {}
     parts_for_compute: List[Tuple[str, Tuple[int, ...]]] = []
+    skipped_parts: Set[str] = set()
     for part_text, part_resids in parts:
         present = tuple(r for r in part_resids if r in ref_resid_set)
         part_missing_count[part_text] = len(part_resids) - len(present)
@@ -394,6 +420,27 @@ def evaluate_protein(
                 f"{part_missing_count[part_text]} resid(s) missing in reference: "
                 f"{missing}"
             )
+        # Strict A/B check: every present residue must carry both an
+        # A-side atom (shared or altloc 'A') and a B-side atom (shared or
+        # altloc 'B'). If any residue fails, drop the part with a warning.
+        bad: List[Tuple[int, Set[str]]] = []
+        for rid in present:
+            letters = altloc_letters.get(rid, set())
+            has_a = bool(letters & {".", " ", "A"})
+            has_b = bool(letters & {".", " ", "B"})
+            if not (has_a and has_b):
+                bad.append((rid, letters))
+        if bad:
+            details = ", ".join(
+                f"{rid}({','.join(sorted(letters)) or '-'})" for rid, letters in bad
+            )
+            print(
+                f"  [{protein_id}] {part_text}: dropped — residue(s) "
+                f"{details} lack altloc A or B coverage",
+                file=sys.stderr,
+            )
+            skipped_parts.add(part_text)
+            continue
         parts_for_compute.append((part_text, present))
 
     cluster_key = f"{protein_id}_{entity_id}"
@@ -403,7 +450,7 @@ def evaluate_protein(
             f"  [{protein_id}] no cluster contains entity {cluster_key}",
             file=sys.stderr,
         )
-        return (parts, _zero_stats(part_missing_count))
+        return (parts, _zero_stats(part_missing_count), skipped_parts)
 
     if verbose:
         print(f"  [{protein_id}] cluster {cluster_key} has {len(cluster)} entities")
@@ -471,7 +518,7 @@ def evaluate_protein(
                 continue
             rmsd_a_dict, rmsd_b_dict = res
             with counter_lock:
-                for part_text, _ in parts:
+                for part_text, _ in parts_for_compute:
                     ra = rmsd_a_dict.get(part_text)
                     rb = rmsd_b_dict.get(part_text)
                     if ra is None or rb is None:
@@ -500,7 +547,7 @@ def evaluate_protein(
                 )
 
     if verbose:
-        for part_text, _ in parts:
+        for part_text, _ in parts_for_compute:
             s = part_stats[part_text]
             print(
                 f"  [{protein_id}] {part_text} within {rmsd_threshold} A: "
@@ -508,7 +555,7 @@ def evaluate_protein(
                 f"B={s['n_within_B']}/{s['n_evaluated']}"
             )
 
-    return (parts, part_stats)
+    return (parts, part_stats, skipped_parts)
 
 
 # ----------------------------------- CLI ------------------------------------
@@ -676,7 +723,7 @@ def main():
         )
 
         try:
-            _, part_stats = evaluate_protein(
+            _, part_stats, skipped_parts = evaluate_protein(
                 protein_id,
                 selection,
                 clusters,
@@ -696,6 +743,14 @@ def main():
                 }
                 for pt, _ in parts
             }
+            skipped_parts = set()
+
+        if skipped_parts:
+            print(
+                f"  [{protein_id}] {len(skipped_parts)} of {len(parts)} part(s) "
+                f"dropped (altloc letters not A/B)",
+                file=sys.stderr,
+            )
 
         for idx, (part_text, _) in enumerate(parts):
             key = (
@@ -706,6 +761,8 @@ def main():
             )
             if key in key_to_index:
                 continue  # leave the cached row untouched
+            if part_text in skipped_parts:
+                continue  # altloc-incomplete part: drop with warning, no row
             stats = part_stats.get(
                 part_text,
                 {
